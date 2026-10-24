@@ -1,0 +1,83 @@
+--- a/src/core/types.ts
++++ b/src/core/types.ts
+@@ -227,6 +227,8 @@
+   /** Persona 定义的 session id；Core 仅用于查询、用量统计和日志关联。 */
+   role: string;
+   log: Logger;
++  /** 本次唤醒已投递事件的可信来源及会话快照；由主循环填写，不接受模型工具参数提供的来源。 */
++  triggerEvents?: readonly Pick<EventEnvelope, 'source' | 'type' | 'origin' | 'senderKey'>[];
+   /**
+    * 将工具执行期间取得的外部事件交给主循环，在本轮工具结果之后投递。
+    * 仅主循环提供；其他调用方可省略。
+@@ -910,6 +912,8 @@
+   envPromptVars(): Record<string, string> | null | Promise<Record<string, string> | null>;
+   /** 工具定义和用法由 World 提供；使用时机与跨工具指导写入环境提示词。 */
+   tools(): ToolDef[];
++  /** 所有工具（含 Persona 工具）执行前的权限检查；返回拒绝理由，null 表示放行。 */
++  checkToolCall?(name: string, ctx: ToolCallContext): string | null;
+   /**
+    * 每次 WebUI 请求按浏览器 language 生成声明和响应文案，省略时为中文。
+    * 语言不缓存，不影响发给模型的文本；未实现时仅显示通用信息。
+--- a/src/core/loop.ts
++++ b/src/core/loop.ts
+@@ -263,6 +263,8 @@
+   private running = false;
+   private stopFn: (() => void) | null = null;
+   private toolDefs: ToolDef[] = [];
++  /** 同一次唤醒跨轮累积来源，内部事件不能清除已收到的 QQ 来源。 */
++  private toolTriggerEvents: NonNullable<ToolCallContext['triggerEvents']> = [];
+   private batchesHandled = 0;
+   private roundsLastBatch = 0;
+   /** 跨唤醒批次单调递增的轮序号;每建一份工具 ctx 加一,透传给 ToolCallContext.round */
+@@ -479,9 +481,23 @@
+         log.warn(`工具未分类(tags为空,不参与任何tag过滤): ${def.name}`);
+       }
+       seen.add(def.name);
+-      defs.push(def);
++      defs.push({
++        ...def,
++        handler: async (args, ctx) => {
++          // 在 handler 边界检查，流式提前执行和普通调用均经过这里。
++          for (const world of this.d.worlds.all()) {
++            const denied = world.checkToolCall?.(def.name, ctx);
++            if (denied) return { text: denied, failed: true };
++          }
++          return def.handler(args, ctx);
++        },
++      });
+     }
+     this.toolDefs = defs;
++    const policyWorlds = this.d.worlds.all().filter((world) => typeof world.checkToolCall === 'function').map((world) => world.id);
++    if (policyWorlds.length > 0) {
++      log.info('工具来源权限保护已装配', { protection: 'qq-local-v1', worlds: policyWorlds });
++    }
+   }
+ 
+   /** 空 tags 只报告一次。 */
+@@ -700,6 +716,10 @@
+       session.append(msg);
+     }
+     if (events.length > 0 && !inUser) this.appendEventFrame(events);
++    this.toolTriggerEvents = Object.freeze([
++      ...this.toolTriggerEvents,
++      ...delivered.map(({ source, type, origin, senderKey }) => Object.freeze({ source, type, origin, senderKey })),
++    ]);
+     this.noteHandled(delivered, generation);
+     this.notifySettled(delivered, 'delivered');
+     const changed = lines.length > 0 || events.length > 0;
+@@ -1046,6 +1066,7 @@
+         if (!this.active(generation)) break;
+         this.processingBatch = true;
+         this.takeReadyBeforeRequest = false;
++        this.toolTriggerEvents = [];
+         try {
+           const changed = await this.deliverBatch(batch, generation);
+           if (!this.active(generation)) break;
+@@ -1155,6 +1176,7 @@
+         role: decl.id,
+         log,
+         round: roundNo,
++        triggerEvents: this.toolTriggerEvents,
+         // interruptible 工具在 runToolHandler 里再合并本轮的 interrupt 信号。
+         signal: this.shutdown.signal,
+         queueExternalEvents: (events) => {

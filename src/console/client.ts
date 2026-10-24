@@ -3,6 +3,7 @@ import type {
   WebUiPanel,
   WebUiPanelContext,
 } from 'cortico/web/shared/client-panel.ts';
+import { mountNapCatLauncher } from './launcher.ts';
 
 type FieldDef = {
   key: string;
@@ -198,6 +199,7 @@ function makePanel(m: ModuleSpec): WebUiPanel {
       // 连接与监听：顶部放「使用教程」链接 + 「重启连接」按钮。
       // 连接类配置改了之后点一下重启即可生效，不必整进程重启。
       if (m.id === 'general') {
+        mountNapCatLauncher(ctx, sheet.body);
         const bar = ui.rowbar();
 
         const link = document.createElement('a');

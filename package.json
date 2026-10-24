@@ -11,6 +11,7 @@
     "README.md",
     "CHANGELOG.md",
     "ENV_PROMPT.md",
+    "docs",
     "asr_sidecar.py",
     "LICENSE"
   ],
@@ -38,7 +39,7 @@
       "qq",
       "external-setup"
     ],
-    "webUiClient": "dist/console.js",
+    "webUiClient": "dist/console-264dd3742344.js",
     "webUiStyle": "dist/console.css",
     "describe": "describe.json"
   },
@@ -49,7 +50,7 @@
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "build": "tsc --noEmit -p tsconfig.json",
     "build:console": "node scripts/build-console.mjs",
-    "test": "node --test tests/normalize.test.ts tests/config.test.ts tests/security.test.ts tests/forward.test.ts"
+    "test": "node --import tsx --test tests/normalize.test.ts tests/config.test.ts tests/security.test.ts tests/forward.test.ts tests/safety-additions.test.ts tests/image-download.test.ts"
   },
   "dependencies": {
     "ws": "^8.18.0"
@@ -57,6 +58,8 @@
   "devDependencies": {
     "@types/node": "^22.10.0",
     "@types/ws": "^8.5.13",
+    "esbuild": "^0.28.2",
+    "tsx": "^4.20.0",
     "typescript": "^5.7.0"
   }
 }

@@ -3,6 +3,7 @@ import type { QQWorldConfig } from './config.ts';
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, writeFileSync, appendFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { downloadImage } from './image-download.ts';
 
 /**
  * 被动视觉（可选，默认关闭）：下载图片并用 OpenAI 兼容端点（如 OpenRouter）VLM 描述。
@@ -163,19 +164,7 @@ export class Vision {
   }
 
   private async fetchBytes(url: string): Promise<Uint8Array | null> {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), this.cfg.timeoutMs);
-    try {
-      const res = await fetch(url, { signal: ctrl.signal });
-      if (!res.ok) return null;
-      const buf = Buffer.from(await res.arrayBuffer());
-      if (buf.byteLength > this.cfg.maxBytes) return null;
-      return buf;
-    } catch {
-      return null;
-    } finally {
-      clearTimeout(timer);
-    }
+    return downloadImage(url, { timeoutMs: this.cfg.timeoutMs, maxBytes: this.cfg.maxBytes });
   }
 
   private async describe(bytes: Uint8Array): Promise<string | null> {

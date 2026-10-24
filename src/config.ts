@@ -138,6 +138,10 @@ export interface QQWorldConfig {
   reminder: {
     /** 是否启用“到点自动发提醒”。记录 / 查询 / 取消不受此开关影响（始终可用）。 */
     enabled: boolean;
+    /** 按配置时区的自然日、所有 QQ 会话合计的到点处理上限。 */
+    dailyQuota: number;
+    /** 超额时直接发文字，不调用模型；{limit} 替换为当前上限。 */
+    limitMessage: string;
   };
   /** 自称（第一人称昵称）：用于主动说话调度器与作息状态文本。
    *  - 留空（默认）：回退到登录 QQ 昵称，再不行回退「我」。
@@ -247,11 +251,17 @@ export interface QQWorldConfig {
    * 开启后，qq_send 对 private:<QQ> 目标跳过私聊监听名单限制，可向任意群成员发起私聊分流。默认 true。
    */
   allowPrivateRedirect?: boolean;
+  /** 允许 QQ 来源使用电脑控制、文件等本地工具；默认关闭。 */
+  allowLocalOperations: boolean;
+  /** 本机界面启动 NapCat 使用的固定 EXE 路径，不提供给模型工具。 */
+  napcatLauncher: string;
 }
 
 
 export const QQ_DEFAULTS: QQWorldConfig = {
   mode: 'reverse',
+  allowLocalOperations: false,
+  napcatLauncher: '',
   // 默认关闭：qq_send 发 private:<QQ> 时一律查监听名单，群里任何人无法让 bot 私聊任意 QQ 号。
   // 仅当你确实需要 bot 主动私聊「非监听会话里的某个人」时再开（此时仍受监听/授权约束保护）。
   allowPrivateRedirect: false,
@@ -346,6 +356,8 @@ export const QQ_DEFAULTS: QQWorldConfig = {
   },
   reminder: {
     enabled: true,
+    dailyQuota: 5,
+    limitMessage: '今天的提醒次数已达上限（每天最多 {limit} 次，各群和私聊合计），这条提醒不再发送。',
   },
   selfName: '',
   voice: {
@@ -420,6 +432,16 @@ export const QQ_CONFIG_GROUP: ConfigGroup = {
     title: 'QQ · 连接与监听',
     description: 'OneBot v11 / NapCat 连接参数与监听名单；连接类改动需重启生效。',
     properties: {
+      'worlds.qqbot.napcatLauncher': {
+        type: 'string', title: 'NapCat 启动器路径', 'x-hot': true,
+        description: '填写本机 NapCatWinBootMain.exe 的完整路径，供上方启动按钮使用。只从本机界面启动，不接受聊天命令。',
+      },
+      'worlds.qqbot.allowLocalOperations': {
+        type: 'boolean',
+        title: '允许 QQ 消息调用本地操作',
+        'x-hot': true,
+        description: '需配套宿主权限保护补丁，仅更新插件不能阻止本地工具。默认关闭：QQ 消息、提醒和主动事件只能使用 QQ 工具，禁止截图、键鼠、窗口操作、本地设置及通用文件工具；保留聊天、历史查询和已有共享上下文。本机直接输入的请求可正常使用本地工具。同一轮混入 QQ 事件时仍限制本地操作。开启后监听到的 QQ 消息可使用本地能力，仍遵循桌面助手原有的授权规则。',
+      },
       'worlds.qqbot.mode': {
         type: 'string',
         title: '连接模式',
@@ -491,6 +513,8 @@ export const QQ_CONFIG_GROUP: ConfigGroup = {
       'worlds.qqbot.routine.greetWake': { type: 'string', title: '醒来播报(兜底)', 'x-hot': true, description: '离开睡眠段的兜底文案：正常由 LLM 生成，失败才回退。空=无兜底。' },
       'worlds.qqbot.routine.greetLazy': { type: 'string', title: '午休播报(兜底)', 'x-hot': true, description: '进入午休段的兜底文案：正常由 LLM 生成，失败才回退。空=无兜底。' },
       'worlds.qqbot.reminder.enabled': { type: 'boolean', title: '到点提醒', 'x-hot': true, description: '开启后，记下的定时提醒会在到点时自动发到对应会话；记录/查询/取消不受此开关影响（始终可用）。' },
+      'worlds.qqbot.reminder.dailyQuota': { type: 'integer', title: '每日提醒总次数上限', minimum: 1, 'x-hot': true, description: '默认每天 5 次，所有群和私聊共用；按上方配置时区每天零点重置，重启保留计数。限制到点处理次数，不限制设置数量。超额时直接发送固定提示，不调用 AI，也不把该提醒顺延到次日。最小为 1；要停用提醒请关闭“到点提醒”。' },
+      'worlds.qqbot.reminder.limitMessage': { type: 'string', title: '提醒超限提示', 'x-hot': true, description: '超额提醒到点时由程序直接发送的普通文字，不调用模型或语音合成；{limit} 自动替换为当前上限。同一会话每天最多提示一次，避免刷屏。设置提醒和普通聊天仍按原流程使用 AI。' },
       'worlds.qqbot.admin.enabled': { type: 'boolean', title: '群管理员能力', 'x-hot': true, description: '开启后可在群里执行管理员操作：群撤回 / @全体成员 / 发群通知 / 审核进群 / 给予群头衔 / 禁言（及全员禁言）/ 踢出群聊。需要 bot 是群管理员或群主，否则 QQ 会拒绝。qq_admin 工具始终可用（action 选子功能：recall/at_all/notice/join_*/title/ban/ban_all/kick），关闭则提示“功能未开启”。' },
       'worlds.qqbot.admin.allowlist': { type: 'string', title: '授权指挥官(QQ号,逗号分隔)', 'x-hot': true, description: '白名单：这些 QQ 号的人可在对话里命令 bot 执行管理员操作（撤消息/禁言等），不受群身份限制。多个用逗号分隔，如 123456,654321。留空=不单独授权任何人。' },
       'worlds.qqbot.admin.allowGroupAdmins': { type: 'boolean', title: '允许群管/群主指挥', 'x-hot': true, description: '为 true 时，群里的管理员/群主在对话里发话即可指挥 bot 执行管理操作。设为 false 则只有白名单里的人能指挥。' },
@@ -619,6 +643,8 @@ export function normalizeConfig(raw: QQConfigSection): QQWorldConfig {
   for (const [k, v] of Object.entries(QQ_DEFAULTS)) {
     if (c[k] === undefined) c[k] = v;
   }
+  c.allowLocalOperations = c.allowLocalOperations === true;
+  if (typeof c.napcatLauncher !== 'string') c.napcatLauncher = '';
   c.groups = toIds(c.groups);
   c.privates = toIds(c.privates);
   if (typeof c.privateAggregationWindow !== 'number') c.privateAggregationWindow = QQ_DEFAULTS.privateAggregationWindow;
@@ -708,10 +734,12 @@ export function normalizeConfig(raw: QQConfigSection): QQWorldConfig {
   if (typeof rt.greetWake !== 'string') rt.greetWake = QQ_DEFAULTS.routine.greetWake;
   if (typeof rt.greetLazy !== 'string') rt.greetLazy = QQ_DEFAULTS.routine.greetLazy;
   // reminder 子对象原地合并
-  c.reminder = c.reminder && typeof c.reminder === 'object' ? c.reminder : {};
+  c.reminder = c.reminder && typeof c.reminder === 'object' ? c.reminder : { ...QQ_DEFAULTS.reminder };
   Object.assign(c.reminder, { ...QQ_DEFAULTS.reminder, ...(c.reminder as object) });
   const rm = c.reminder as Record<string, unknown>;
   if (typeof rm.enabled !== 'boolean') rm.enabled = true;
+  if (!Number.isSafeInteger(rm.dailyQuota) || (rm.dailyQuota as number) < 1) rm.dailyQuota = QQ_DEFAULTS.reminder.dailyQuota;
+  if (typeof rm.limitMessage !== 'string' || !rm.limitMessage.trim()) rm.limitMessage = QQ_DEFAULTS.reminder.limitMessage;
   // voice 子对象原地合并
   c.voice = c.voice && typeof c.voice === 'object' ? c.voice : {};
   Object.assign(c.voice, { ...QQ_DEFAULTS.voice, ...(c.voice as object) });

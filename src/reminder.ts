@@ -43,8 +43,8 @@ export function parseWhen(input: string, now: Date = new Date()): number | null 
     const n = parseInt(rel[1], 10);
     const unit = rel[2].toLowerCase();
     let ms = 0;
-    if (unit.startsWith('m')) ms = n * 60_000;
-    else if (unit.startsWith('h')) ms = n * 3_600_000;
+    if (unit.startsWith('m') || unit === '分钟') ms = n * 60_000;
+    else if (unit.startsWith('h') || unit === '小时') ms = n * 3_600_000;
     else ms = n * 86_400_000;
     return now.getTime() + ms;
   }

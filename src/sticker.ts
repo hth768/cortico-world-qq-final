@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, extname } from 'node:path';
+import { downloadImage } from './image-download.ts';
 import type { Logger } from 'cortico/core/types.ts';
 
 /** 单张表情包的元数据（按内容 sha256 去重）。 */
@@ -366,19 +367,7 @@ export class StickerStore {
   }
 
   private async fetchBytes(url: string): Promise<Uint8Array | null> {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), this.vision.timeoutMs);
-    try {
-      const res = await fetch(url, { signal: ctrl.signal });
-      if (!res.ok) return null;
-      const buf = Buffer.from(await res.arrayBuffer());
-      if (buf.byteLength > this.vision.maxBytes) return null;
-      return buf;
-    } catch {
-      return null;
-    } finally {
-      clearTimeout(timer);
-    }
+    return downloadImage(url, { timeoutMs: this.vision.timeoutMs, maxBytes: this.vision.maxBytes });
   }
 
   private load(): void {
