@@ -1653,11 +1653,21 @@ export class QQWorld implements World {
       const sub = ev.sub_type;
       const conv = this.ensureConv(ev.group_id ? 'group' : 'private', ev.group_id ?? ev.user_id ?? 0);
       if (sub === 'poke') {
+        const poker = Number(ev.user_id) || 0;
+        const rawTarget = Number(ev.target_id) || 0;
+        const selfId = this.identity?.selfId ?? 0;
+        // NapCat 在「戳的是 bot 自己」时，target_id 会误回显成 poker（与 user_id 相同），
+        // 导致把"别人戳了 bot"误报成"别人戳了自己"。以 bot 自身 QQ 校正：被戳方若缺失、
+        // 等于 poker（误回显）或等于 bot 自身，一律记为「被戳的是 bot 自己」。
+        const pokeeIsBot = rawTarget === 0 || rawTarget === poker || rawTarget === selfId;
+        const text = pokeeIsBot
+          ? `${conv.label}：${poker} 戳了你一下`
+          : `${conv.label}：${poker} 戳了 ${rawTarget}`;
         await host.pushEvent({
           type: 'qq.poke',
           ts: eventTs(this.config.timezone),
           source: SOURCE,
-          text: `${conv.label}：${ev.user_id} 戳了 ${ev.target_id}`,
+          text,
           senderKey: conv.address,
         });
       } else if (sub === 'emoji') {

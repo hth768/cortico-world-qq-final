@@ -1,6 +1,6 @@
 {
   "name": "cortico-world-qq-final",
-  "version": "0.6.39",
+  "version": "0.6.40",
   "description": "Cortico World 扩展：QQ（OneBot v11 / NapCat）适配器。",
   "type": "module",
   "main": "./src/index.ts",
