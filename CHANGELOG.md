@@ -2,6 +2,14 @@
 
 本文件记录 cortico-world-qq-final 每个版本的改动，供扩展市场的「更新说明」直接读取。
 
+## 0.6.42
+
+- 修复 `asr.mode=local` 下 QQ 语音 100% 无法识别（用户提交的 bug 报告：SILK 语音转文字不可用）。
+  - 根因：QQ 语音真身是腾讯私有 **SILK_V3**（扩展名却常是 `.amr`），而 ffmpeg 全平台、全版本均无 SILK 解码器。原 `decodeToWav` 直接把下载到的字节丢给 ffmpeg，必返回 `Invalid data found`，识别服务 `/asr` 永远不会被调用；回退的 OneBot `translate_record` 在 NapCat 下又返回 `retcode=1404`（不支持），于是整条链无可用识别路径，用户只看到 `[语音]`。失败文案还误导用户去查 ffmpeg 路径。
+  - 修复：新增依赖 `silk-wasm`（纯 WASM，零系统依赖，跨平台），在交给 ffmpeg **之前**先判 `#!SILK_V3` 魔数，命中即用内置解码转 16k 单声道 WAV，**彻底不依赖 ffmpeg**；只有真实 AMR/MP3 等非 SILK 格式才走 ffmpeg（保留该分支，不破坏既有能力）。
+  - 文案/契约修正：失败日志改为按原因区分——`QQ 语音下载失败`/`SILK 语音解码失败（ffmpeg 也不支持 SILK_V3）`/`未配置 ffmpeg`，不再一条笼统的「请检查 ffmpeg 路径」；并移除进程级一次性 `ffmpegWarned` 开关（会导致后续每条语音静默丢弃），改为 60s 节流告警。
+  - 文档同步：`README.md`（配置表、`asr.ffmpegPath` 说明、收语音段落、语音解码段落）与 `config.ts` 控制台字段/接口注释，删除「ffmpeg 可解 SILK」的错误表述，明确 QQ 语音由内置 silk-wasm 解码。
+
 ## 0.6.41
 
 - 群监听改为白名单模式（用户 2026-10-30 要求）：此前 `groups` 留空=监听接入的全部群；现改为与私聊一致——`groups` 留空=**不监听任何群**，只有在 `groups` 里显式配置的群号才会被监听。

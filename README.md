@@ -117,7 +117,7 @@ Cortico 的 **QQ（OneBot v11 / NapCat）** World 扩展。以 `fat-fish` 仓库
 | `asr.cloudUrl` | `""` | OpenAI 兼容 ASR 基址（`cloud` 必填），如 `http://127.0.0.1:8000/v1` |
 | `asr.cloudApiKeySecret` | `ASR_API_KEY` | 云端 ASR 密钥名；值写在部署密钥库（.env）里，由框架 `secret()` 读取 |
 | `asr.cloudModel` | `glm-asr-2512` | 云端 ASR 模型名 |
-| `asr.ffmpegPath` | `""` | ffmpeg 可执行文件路径（用于把 SILK/AMR 解码成 WAV）。空=依次找 PATH 与仓库 `node_modules/ffmpeg-static`（win 用 `ffmpeg.exe`）；找不到则语音识别不可用 |
+| `asr.ffmpegPath` | `""` | ffmpeg 可执行文件路径（仅用于把 AMR/MP3 等通用格式解码成 WAV；QQ 语音为 SILK_V3，由扩展内置 silk-wasm 解码，无需 ffmpeg）。空=依次找 PATH 与仓库 `node_modules/ffmpeg-static`（win 用 `ffmpeg.exe`）；找不到则此类通用格式语音无法识别（SILK 不受影响） |
 | `asr.transcribeTimeout` | `60000` | 识别超时（毫秒）：单次 ffmpeg 解码 + 识别请求共用（1000~600000） |
 | `voice.voxcpmUrl` | `http://127.0.0.1:8765` | 选 `voxcpm` 供应商时必填：本地 VoxCPM2 TTS 服务基址（如 Fat-Fish 的 `vox_tts_server.py`）。服务暴露 `GET /health`（就绪返回 `{"ready":true,"state":"ready"}`）与 `POST /tts`（返回 48kHz WAV） |
 | `voice.voxcpmVoiceDesc` | `可爱傲娇少女音` | VoxCPM2 说话人音色（自然语言描述） |
@@ -271,7 +271,7 @@ interface VoiceProvider {
 - `qq_qzone（action=status）`：返回空间功能开关、今日已发数/配额、待回评等状态。
 - 群聊发言限速 / 话题防死循环在 `qq_send` 发送环节统一生效：长回复拆成多条 QQ 消息时逐条检查限速并计数；达到上限后，剩余段不发送，工具会报告实际已发条数。会话连续发言超限或对方久未接话时，也会停止发送。这是正常节流，不是报错。
 - **语音工具 / 命令**：
-  - 收语音：QQ 语音消息经 `voice.provider` 指定的 ASR 后（如 `native` 的 `translate_record`、或 OpenAI 兼容 `/audio/transcriptions`）转成文字进入对话；SILK 等编码能否被识别取决于所选供应商（QQ 语音多为 SILK，`native` 由 NapCat 服务端解码最稳，`custom`/`local` 一般要 wav/mp3/flac）。
+  - 收语音：QQ 语音（SILK_V3）由扩展内置 silk-wasm 解码后送 `asr.transcribeUrl` 识别；未配 `asr.transcribeUrl` 时回退到 `voice.provider` 的 ASR（如 `native` 的 `translate_record`、或 OpenAI 兼容 `/audio/transcriptions`）。QQ 语音多为 SILK，`native` 由 NapCat 服务端解码最稳，`custom`/`local` 一般要 wav/mp3/flac。
   - 说语音：`voice.tts` 开启且主模型在 `qq_send` 中设置 `voice=true` 时，回复文字经 TTS 合成成语音段（如 `native` 的 `tts` 或 OpenAI 兼容 `/audio/speech`，`local` 可透传 `voiceExtraTts` 做声音克隆/设计）发出；失败且 `voice.audioFallback` 开启时回退文字。
   - 运行时命令（聊天里即时生效，优先级高于控制台配置）：`/语音 开` / `/语音 关`（整体开关）、`/语音 asr 开|关`、`/语音 tts 开|关`、`/语音 状态`（查看当前开关与所选供应商）。是否发送语音由主模型在 `qq_send.voice` 中决定。
 - **情绪系统（移植自 fat-fish `emotion.py`）**：
@@ -389,7 +389,7 @@ interface VoiceProvider {
 
 ## 已知限制 / 与原版的差异
 
-- 语音解码：QQ 语音多为 **SILK** 编码。`native` 供应商由 NapCat 服务端（如 NapCat 的 `translate_record`）解码最稳；`custom`/`local` 供应商走 OpenAI 兼容接口，一般要求 wav/mp3/flac，对 SILK 支持不稳。若识别不了 SILK，可把 `asr.mode` 设为 `local`，并确认本机有 ffmpeg（见 `asr.ffmpegPath`）。腾讯语音 CDN 地址会先以浏览器请求头下载，再交给 ffmpeg 解码；仅处理该固定域名，限制为 32 MB 且不跟随跳转。本地/远程服务不可达或超时（`asr.transcribeTimeout` 控制）时不阻塞对话，回退文字。
+- 语音解码：QQ 语音真身是腾讯私有 **SILK_V3** 编码（文件名却常是 `.amr`）。从 0.6.42 起，扩展**内置 silk-wasm** 直接解码 SILK，无需 ffmpeg；只要配了 `asr.transcribeUrl`（本地/远程 ASR 侧车，如 sherpaOnnx / faster-whisper 的 `/asr`），QQ 语音就能稳定转文字（`native` 供应商的 OneBot `translate_record` 也可，但依赖协议端已解码）。ffmpeg 仍用于 AMR/MP3 等通用格式，对 SILK 无能为力——所以「识别不出语音」时请先确认 `asr.transcribeUrl` 已正确配置，而非去查 ffmpeg。腾讯语音 CDN 地址会先以浏览器请求头下载再解码；仅处理该固定域名，限制 32 MB 且不跟随跳转。本地/远程服务不可达或超时（`asr.transcribeTimeout` 控制）时不阻塞对话，回退文字。
 - 合并转发展开、视频/文件等大二进制默认只做文本占位（不自动作为附件，避免撑爆上下文）。展开后的 `qq.forward` 事件头会标注「转发来源：群「<群名>(<号>)」/ 私聊「<昵称>(<QQ>)」/ 多个来源」，帮助模型判断语境；来源恰好就是收到转发的当前会话时不重复标注（从每个转发节点捕获 `group_id`/对方 QQ，由 SnowLuma `get_forward_msg` 返回）。
 - **合并转发消息（不伪造身份）**：`qq_forward_by_id` 工具可按消息编号把本 bot 已接收/发出的多条消息合成**一张**合并转发卡片发出（卡片由本 bot 发出，node 身份只能是 bot 自己；卡片内每条消息用文本标注原始发送者昵称+QQ号并保留原文内容，不伪造任何身份）。需先开启设置 `worlds.qqbot.forwardByMessageId`（默认关闭），且仅能转发本 bot 本地记录内、属于目标会话的消息编号；依赖 OneBot 的 `send_forward_msg` 与 `get_msg`（NapCat/Lagrange/SnowLuma 等主流 OneBot v11 实现大多支持）。受 OneBot 限制，合并卡片无法把 node 身份设成原始发送者，故用「文本标注来源」保留出处。
 - 群成员名片为空时尝试补一次 `get_group_member_info`，但离线名片仍以 NapCat 推送为准。

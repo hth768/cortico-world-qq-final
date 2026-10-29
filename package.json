@@ -1,6 +1,6 @@
 {
   "name": "cortico-world-qq-final",
-  "version": "0.6.41",
+  "version": "0.6.42",
   "description": "Cortico World 扩展：QQ（OneBot v11 / NapCat）适配器。",
   "type": "module",
   "main": "./src/index.ts",
@@ -53,6 +53,7 @@
     "test": "node --test tests/normalize.test.ts tests/config.test.ts tests/security.test.ts tests/forward.test.ts tests/image-store.test.ts tests/file-store.test.ts tests/video.test.ts"
   },
   "dependencies": {
+    "silk-wasm": "^3.7.1",
     "ws": "^8.18.0"
   },
   "devDependencies": {

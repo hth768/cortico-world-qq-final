@@ -17,6 +17,11 @@ import { writeFileSync, existsSync, mkdirSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+// 腾讯 SILK_V3 解码（QQ 语音真身，扩展名却常是 .amr）：用内置 silk-wasm（纯 WASM，零系统依赖）。
+// ffmpeg 全平台、全版本都没有 SILK 解码器，故 QQ 语音不走 ffmpeg。
+import * as silkWasm from 'silk-wasm';
+const silkDecode = (silkWasm as unknown as { decode?: (i: ArrayBufferView | ArrayBuffer, sr: number) => Promise<{ data: Uint8Array }> }).decode
+  ?? (silkWasm as unknown as { default?: { decode?: (i: ArrayBufferView | ArrayBuffer, sr: number) => Promise<{ data: Uint8Array }> } }).default?.decode;
 /** 精简的 driver 能力（只需 callApi）。 */
 export interface VoiceDriver {
   callApi<T = unknown>(action: string, params: Record<string, unknown>): Promise<T>;
@@ -44,11 +49,11 @@ export interface RuntimeVoiceCfg {
   voiceTimeout: number;
   /** TTS 额外参数（合并进 /audio/speech 的 JSON body），用于本地模型高级特性（如 VoxCPM2 的 reference_audio / voice_design / language）。 */
   voiceExtraTts: Record<string, unknown>;
-  /** 专用识别服务地址（alont1 风格 ASR）：POST {url}/asr 收 WAV 字节 → {text}。非空时优先走此路（ffmpeg 解码 SILK/AMR 后送识别），比 OpenAI /audio/transcriptions 更稳地处理 QQ 原生 SILK 语音。 */
+  /** 专用识别服务地址（alont1 风格 ASR）：POST {url}/asr 收 WAV 字节 → {text}。非空时优先走此路；QQ 语音为 SILK_V3，由扩展内置 silk-wasm 解码后送识别（无需 ffmpeg），通用格式（AMR/MP3 等）才转交 ffmpeg，比 OpenAI /audio/transcriptions 更稳。 */
   transcribeUrl: string;
   /** 识别服务单次超时（毫秒）。 */
   transcribeTimeout: number;
-  /** ffmpeg 候选路径（按 配置 → PATH → 仓库 ffmpeg-static 顺序尝试），用于把 SILK/AMR 解码成 WAV。 */
+  /** ffmpeg 候选路径（按 配置 → PATH → 仓库 ffmpeg-static 顺序尝试），仅用于把 AMR/MP3 等通用格式解码成 WAV；QQ 语音是 SILK_V3，由扩展内置解码，不依赖 ffmpeg。 */
   ffmpegCandidates: string[];
   /** VoxCPM 本地 TTS 服务基址（provider 选 voxcpm 时必填），如 http://127.0.0.1:8765。 */
   voxcpmUrl: string;
@@ -390,22 +395,117 @@ const voxcpmProvider: VoiceProvider = {
 registerVoiceProvider(voxcpmProvider);
 
 /* ------------------------------------------------------------------ *
- * 专用识别服务（alont1 风格 ASR）：ffmpeg 解码 SILK/AMR → WAV，再 POST {url}/asr
- *  - 与 provider 解耦：配了 transcribeUrl 就优先走这条（QQ 原生 SILK 语音也能识别）；
- *    没配则回退到供应商自带 ASR（native 的 translate_record / custom·local 的 OpenAI /audio/transcriptions）。
+ * 专用识别服务（alont1 风格 ASR）：解码语音 → WAV → POST {url}/asr
+ *  - QQ 语音真身是腾讯私有 SILK_V3（扩展名却常是 .amr）。ffmpeg 全平台、全版本都没有
+ *    SILK 解码器，所以 QQ 语音**不**走 ffmpeg，而是由扩展内置的 silk-wasm（纯 WASM，零系统依赖）
+ *    解码成 16k 单声道 WAV；只有真正非 SILK 的通用格式（AMR/MP3 等）才交给 ffmpeg。
+ *  - 与 provider 解耦：配了 transcribeUrl 就优先走这条；没配则回退到供应商自带 ASR
+ *    （native 的 translate_record / custom·local 的 OpenAI /audio/transcriptions）。
  *  - 服务契约：POST {transcribeUrl}/asr，请求体为 WAV 字节（content-type: audio/wav），
  *    返回 JSON { text: "..." }。识别失败/超时一律回退，绝不阻塞消息。
  * ------------------------------------------------------------------ */
 // 已试通的 ffmpeg（试通一个就记住，免得每条语音都从头试候选）。
 let resolvedFfmpeg: string | null = null;
-let ffmpegWarned = false;
+// 解码告警节流：避免每条语音都打、也避免只打一次后彻底静默（原 ffmpegWarned 一次性开关的坑）。
+let lastDecodeWarnTs = 0;
+function throttledDecodeWarn(log: VoiceLog | undefined, msg: string): void {
+  if (!log) return;
+  const now = Date.now();
+  if (now - lastDecodeWarnTs < 60_000) return;
+  lastDecodeWarnTs = now;
+  log.warn(`[voice] ${msg}`);
+}
 
-/** 用 ffmpeg 把语音 url 解码成 16k 单声道 WAV 字节；无可用 ffmpeg 或失败返回 null（best-effort，不阻塞）。 */
-async function decodeToWav(url: string, candidates: string[], timeoutMs: number): Promise<Uint8Array | null> {
-  if (!candidates.length) return null;
+const SILK_MAGIC = Buffer.from('#!SILK_V3');
+
+/** 在字节里找子序列；找不到返回 -1。 */
+function indexOfBytes(haystack: Uint8Array, needle: Uint8Array): number {
+  if (!needle.length) return 0;
+  for (let i = 0; i + needle.length <= haystack.length; i++) {
+    let ok = true;
+    for (let j = 0; j < needle.length; j++) {
+      if (haystack[i + j] !== needle[j]) { ok = false; break; }
+    }
+    if (ok) return i;
+  }
+  return -1;
+}
+
+/** QQ 语音真身是腾讯私有 SILK_V3（扩展名却常是 .amr）；文件头可能前有 ≤4 字节标记（如 0x02）。 */
+function looksLikeSilk(buf: Uint8Array): boolean {
+  const at = indexOfBytes(buf, SILK_MAGIC);
+  return at >= 0 && at <= 4;
+}
+
+/** 裸 PCM(s16le) → 16k 单声道 WAV 字节。 */
+function pcmToWav(pcm: Int16Array, sampleRate = 16000): Uint8Array {
+  const numChannels = 1;
+  const bytesPerSample = 2;
+  const blockAlign = numChannels * bytesPerSample;
+  const dataSize = pcm.length * bytesPerSample;
+  const buf = Buffer.alloc(44 + dataSize);
+  buf.write('RIFF', 0, 'ascii');
+  buf.writeUInt32LE(36 + dataSize, 4);
+  buf.write('WAVE', 8, 'ascii');
+  buf.write('fmt ', 12, 'ascii');
+  buf.writeUInt32LE(16, 16);
+  buf.writeUInt16LE(1, 20);
+  buf.writeUInt16LE(numChannels, 22);
+  buf.writeUInt32LE(sampleRate, 24);
+  buf.writeUInt32LE(sampleRate * blockAlign, 28);
+  buf.writeUInt16LE(blockAlign, 32);
+  buf.writeUInt16LE(8 * bytesPerSample, 34);
+  buf.write('data', 36, 'ascii');
+  buf.writeUInt32LE(dataSize, 40);
+  for (let i = 0; i < pcm.length; i++) buf.writeInt16LE(pcm[i] ?? 0, 44 + i * 2);
+  return buf;
+}
+
+/** SILK_V3 字节 → 16k 单声道 WAV 字节（用内置 silk-wasm，不依赖 ffmpeg）。 */
+async function silkToWav(bytes: Uint8Array): Promise<Uint8Array | null> {
+  if (typeof silkDecode !== 'function') return null;
+  if (indexOfBytes(bytes, SILK_MAGIC) < 0) return null;
+  try {
+    // 重要：silk-wasm 的 WASM 解码器要求保留 QQ 语音可能带有的 0x02 前缀，
+    // 必须传入原始字节，不要从魔数位置截断。
+    const { data } = await silkDecode(bytes, 16000);
+    if (!data || !data.length) return null;
+    const samples = Math.floor(data.byteLength / 2);
+    if (!samples) return null;
+    // data 为 pcm_s16le；按小端组装成 Int16（平台无关），再包 WAV。
+    const pcm = new Int16Array(samples);
+    for (let i = 0; i < samples; i++) pcm[i] = (data[i * 2] | (data[i * 2 + 1] << 8)) | 0;
+    return pcmToWav(pcm, 16000);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 把语音 url 解码成 16k 单声道 WAV 字节（best-effort，不阻塞）：
+ *  - QQ 语音 CDN 地址先下载；若下载到的字节是 SILK_V3，用内置 silk-wasm 解（无需 ffmpeg）；
+ *  - 非 SILK 的通用格式（AMR/MP3 等）才交给 ffmpeg 解码；
+ *  - 下载失败 / 解码失败都如实告警（不再误导用户去查 ffmpeg 路径）。
+ */
+async function decodeToWav(url: string, candidates: string[], timeoutMs: number, log?: VoiceLog): Promise<Uint8Array | null> {
   const qqCdn = isQqVoiceUrl(url);
   const downloaded = qqCdn ? await fetchQqVoiceBytes(url, timeoutMs) : null;
-  if (qqCdn && !downloaded) return null;
+  if (qqCdn && !downloaded) {
+    throttledDecodeWarn(log, 'QQ 语音下载失败（CDN 不可达/超时/非 2xx），识别服务未调用');
+    return null;
+  }
+  // QQ 语音是 SILK_V3：优先内置解码，不依赖 ffmpeg。
+  if (downloaded && looksLikeSilk(downloaded)) {
+    const wav = await silkToWav(downloaded);
+    if (wav) return wav;
+    throttledDecodeWarn(log, 'SILK 语音解码失败：内置 silk-wasm 解码失败（ffmpeg 也不支持 SILK_V3），识别服务未调用');
+    return null;
+  }
+  // 非 SILK（如真实 AMR/MP3）→ 交给 ffmpeg。
+  if (!candidates.length) {
+    throttledDecodeWarn(log, '语音解码未配置 ffmpeg（asr.ffmpegPath 为空且 PATH 无 ffmpeg），无法解码该语音');
+    return null;
+  }
   const tryOne = (idx: number): Promise<Uint8Array | null> => {
     if (idx >= candidates.length) return Promise.resolve(null);
     const bin = resolvedFfmpeg ?? candidates[idx];
@@ -447,14 +547,8 @@ async function transcribeViaService(ctx: VoiceTranscribeCtx): Promise<string | n
   if (!base) return null;
   const url = seg?.data?.url;
   if (!url) return null;
-  const wav = await decodeToWav(url, cfg.ffmpegCandidates, cfg.transcribeTimeout);
-  if (!wav) {
-    if (!ffmpegWarned) {
-      ffmpegWarned = true;
-      log.warn('[voice] 语音解码失败：请检查 ffmpeg 路径、腾讯语音地址是否可下载，以及 asr.ffmpegPath 配置；识别服务未调用');
-    }
-    return null;
-  }
+  const wav = await decodeToWav(url, cfg.ffmpegCandidates, cfg.transcribeTimeout, log);
+  if (!wav) return null; // decodeToWav 内部已对各类失败打出准确告警（SILK / ffmpeg / 下载）
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), cfg.transcribeTimeout);
   try {

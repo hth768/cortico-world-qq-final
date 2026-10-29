@@ -29,7 +29,7 @@ export interface QQAsrConfig {
   cloudApiKeySecret: string;
   /** 云端 ASR 模型名（OpenAI 兼容 /audio/transcriptions 用，如 whisper-1 / glm-asr-2512）。 */
   cloudModel: string;
-  /** ffmpeg 可执行文件路径（把 QQ 原生 SILK/AMR 解码成 WAV 送识别）；空=依次找 PATH 与仓库 ffmpeg-static。 */
+  /** ffmpeg 可执行文件路径（仅用于把 AMR/MP3 等通用语音格式解码成 WAV 送识别；QQ 语音为 SILK_V3，由扩展内置 silk-wasm 解码，无需 ffmpeg）；空=依次找 PATH 与仓库 ffmpeg-static。 */
   ffmpegPath: string;
   /** 识别单次超时（毫秒，默认 60000）：解码与 /asr 请求共用。 */
   transcribeTimeout: number;
@@ -614,7 +614,7 @@ export const QQ_ASR_GROUP: ConfigGroup = {
     },
     'worlds.qqbot.asr.ffmpegPath': {
       type: 'string', title: 'ffmpeg 路径', 'x-hot': false,
-      description: '解码语音用的 ffmpeg 可执行文件路径（把 SILK/AMR 解码成 WAV 送识别）。空=依次找 PATH 与仓库 node_modules/ffmpeg-static（win 用 ffmpeg.exe）。',
+      description: '解码通用语音格式（AMR/MP3 等）用的 ffmpeg 路径；QQ 语音为 SILK_V3，由扩展内置 silk-wasm 解码，无需 ffmpeg。空=依次找 PATH 与仓库 node_modules/ffmpeg-static（win 用 ffmpeg.exe）。',
     },
     'worlds.qqbot.asr.transcribeTimeout': {
       type: 'integer', title: '识别超时(毫秒)', minimum: 1000, maximum: 600000, 'x-hot': false,
