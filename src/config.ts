@@ -458,7 +458,7 @@ export const QQ_CONFIG_GROUP: ConfigGroup = {
       'worlds.qqbot.wsPort': { type: 'integer', title: '反向监听端口', minimum: 1, maximum: 65535, 'x-hot': false, description: '需与协议端「设置反向客户端」里填的端口一致（出厂默认 8080）。' },
       'worlds.qqbot.wsPath': { type: 'string', title: '反向监听路径', 'x-hot': false, description: '需与协议端「设置反向客户端」里填的路径一致，默认 /onebot/v11/ws。注意结尾的 /ws 不能少。' },
       'worlds.qqbot.token': { type: 'string', title: 'OneBot Token', 'x-hot': false, description: '【反向连接必填】桌宠启动时会自动生成一串随机 Token 并保存到 dataDir/reverse-token.txt（跨重启不变），就显示在下方输入框里。把它整串复制到协议端「设置反向客户端」的鉴权 Token，然后在协议端点「保存连接」，即可连上。仅当连接模式为 forward（正向）时，才改填协议端「设置正向服务器」里那个 Token。' },
-      'worlds.qqbot.groups': { type: 'string', title: '监听群', 'x-hot': true, description: '监听的群号，用空格或逗号分隔；空=全部群。改完即时生效，不用重启。' },
+      'worlds.qqbot.groups': { type: 'string', title: '监听群', 'x-hot': true, description: '监听的群号，用空格或逗号分隔；空=不监听任何群（白名单模式，与私聊一致）。改完即时生效，不用重启。' },
       'worlds.qqbot.privates': { type: 'string', title: '监听私聊', 'x-hot': true, description: '监听的私聊对方 QQ 号，用空格或逗号分隔。改完即时生效，不用重启。' },
       'worlds.qqbot.deliverImageAttachments': { type: 'boolean', title: '图片作为模型附件', 'x-hot': true, description: '开启时把收到的图片直接作为附件喂给主模型（主模型需支持看图）。这是默认的看图路径；「辅助视觉」是另一条用独立 VLM 描述图片的路，两条同时开会重复花钱，主模型能看图时就留着这个、关掉辅助视觉。' },
       'worlds.qqbot.emojiDir': { type: 'string', title: '表情包目录', 'x-hot': false, description: '本地表情包图片目录（相对扩展或绝对路径），供发送 [表情包:文件名] 标记。' },

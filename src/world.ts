@@ -1239,8 +1239,9 @@ export class QQWorld implements World {
 
   private isListened(kind: 'group' | 'private', id: number): boolean {
     if (kind === 'group') {
-      const ids = toIds(this.config.groups);
-      return ids.length === 0 || ids.includes(id);
+      // 群监听为白名单模式：只有在 groups 里显式配置的群才监听；
+      // 不配置（空）则不监听任何群，与私聊监听行为一致。
+      return toIds(this.config.groups).includes(id);
     }
     return toIds(this.config.privates).includes(id);
   }

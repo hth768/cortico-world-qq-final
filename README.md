@@ -50,7 +50,7 @@ Cortico 的 **QQ（OneBot v11 / NapCat）** World 扩展。以 `fat-fish` 仓库
 | `wsUrl` | `ws://127.0.0.1:3001` | 正向模式地址 |
 | `wsHost` / `wsPort` / `wsPath` | `127.0.0.1` / `8080` / `/onebot/v11/ws` | 反向模式监听。**默认只绑回环**：绑 `0.0.0.0` 会让同网段任何机器连上来伪造事件，且无 Token 时直接拒绝启动 |
 | `token` | `""` | OneBot access_token。反向模式留空时**自动生成随机 Token** 并持久化到 `dataDir/reverse-token.txt`（跨重启稳定），需把它填进协议端「设置反向客户端」；绝不退化成无鉴权监听 |
-| `groups` / `privates` | `[]` | 监听群号 / 私聊 QQ；`groups` 为空=接入全部群 |
+| `groups` / `privates` | `[]` | 监听群号 / 私聊 QQ（均为白名单）；`groups` 为空=不监听任何群，`privates` 为空=不监听任何私聊 |
 | `privateAggregationWindow` | `0` | 私聊连续消息聚合窗口(ms)，0=不聚合 |
 | `maxMessageBytes` | `1500` | 长文本强制分片字节数 |
 | `deliverImageAttachments` | `true` | 图片作为模型附件（需模型支持图像）。这是默认的看图路径 |
