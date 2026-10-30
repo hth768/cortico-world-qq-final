@@ -1,1 +1,0 @@
-0.6.44: 修复 Windows 拉 ASR 侧车弹黑框（绕过 venv launcher re-exec）+ 透传代理变量
