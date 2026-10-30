@@ -2218,6 +2218,28 @@ export class QQWorld implements World {
     return { python, script, modelPath, engine: asr.localEngine };
   }
 
+  /** 解析 venv launcher → base 真 python.exe。
+   *  venv 的 Scripts/python.exe 往往是 launcher（如 uv 生成，大小约 262KB），
+   *  它会 re-exec 到 base 真解释器；re-exec 新建的控制台窗口不在 Node spawn 的
+   *  windowsHide 控制范围——这就是「拉 ASR 侧车每次弹黑框」的根因（用户 2026-10-30 反馈）。
+   *  解析成 pyvenv.cfg 指向的 base 真 python.exe 后，spawn 它即无再 re-exec，
+   *  windowsHide 直接作用于终点 CreateProcess，不再弹窗。 */
+  private resolveAsrPython(venvPython: string): string {
+    try {
+      const dir = dirname(venvPython);
+      const cfg = join(dir, '..', 'pyvenv.cfg');
+      if (existsSync(cfg)) {
+        const txt = readFileSync(cfg, 'utf8');
+        const m = txt.match(/^home\s*=\s*(.+)$/m);
+        if (m) {
+          const base = join(m[1].trim(), 'python.exe');
+          if (existsSync(base)) return base;
+        }
+      }
+    } catch { /* 回退原路径 */ }
+    return venvPython;
+  }
+
   /** 拉起本地 ASR 侧车子进程（若尚未运行且端口空闲）。返回本次是否"新拉起"。 */
   private async ensureAsrSidecarLaunched(): Promise<boolean> {
     if (this.asrSidecar && this.asrSidecar.exitCode === null && this.asrSidecar.signalCode === null) return false;
@@ -2234,12 +2256,24 @@ export class QQWorld implements World {
     try {
       const logFile = join(dirname(info.script), 'asr_sidecar.log');
       const logf = openSync(logFile, 'a');
+      // venv 的 Scripts/python.exe 往往是 launcher（如 uv 生成），会 re-exec 到 base 真解释器，
+      // re-exec 新建的控制台窗口不在 Node spawn 的 windowsHide 控制范围（用户 2026-10-30 反馈每次拉侧车都弹黑框）。
+      // 解析成 base 真 python.exe 即可无再 re-exec，windowsHide 直接作用于终点进程，不再弹窗。
+      const python = this.resolveAsrPython(info.python);
+      // 透传代理变量：sidecar 首次运行需联网下载模型（funasr/sherpaOnnx 从 ModelScope/HF 拉取），
+      // 若部署环境走代理则必须传入，否则下载卡死（用户 2026-10-30 反馈的次要问题）。
+      // 仅补充代理相关变量，不引入任何密钥（QQ_ACCESS_TOKEN / 各 API Key 仍不外泄）。
+      const proxyEnv: Record<string, string> = {};
+      for (const k of ['HTTPS_PROXY', 'HTTP_PROXY', 'https_proxy', 'http_proxy', 'NO_PROXY', 'no_proxy']) {
+        const v = process.env[k];
+        if (v) proxyEnv[k] = v;
+      }
       this.asrSidecar = spawn(
-        info.python,
+        python,
         [info.script, String(port), '--engine', info.engine, '--model-dir', info.modelPath],
         {
           cwd: dirname(info.script),
-          // 只透传运行 python 所必需的最小环境，避免把部署里的密钥（如 QQ_ACCESS_TOKEN / 各 API Key）泄露给侧车子进程。
+          // 只透传运行 python 所必需的最小环境 + 代理变量，避免把部署里的密钥（如 QQ_ACCESS_TOKEN / 各 API Key）泄露给侧车子进程。
           env: {
             PATH: process.env.PATH || '',
             SYSTEMROOT: process.env.SYSTEMROOT || '',
@@ -2248,10 +2282,13 @@ export class QQWorld implements World {
             TMP: process.env.TMP || '',
             HOME: process.env.HOME || '',
             LANG: process.env.LANG || '',
+            ...proxyEnv,
           } as Record<string, string>,
           stdio: ['ignore', logf, logf],
-          detached: true,
+          // detached:true 在 Windows 会分配独立控制台，与 windowsHide 冲突且对 re-exec 无效；去掉它。
+          detached: false,
           windowsHide: true,
+          creationFlags: 0x08000000, // CREATE_NO_WINDOW，与 windowsHide 互补，确保终点进程无控制台
         },
       );
       this.asrSidecar.unref();

@@ -2,6 +2,14 @@
 
 本文件记录 cortico-world-qq-final 每个版本的改动，供扩展市场的「更新说明」直接读取。
 
+## 0.6.44
+
+- 修复 Windows 下「拉起 ASR 侧车每次弹黑框控制台」（用户 2026-10-30 反馈，截图复现：qq-final 自动拉 `asr_sidecar.py` 时弹出黑色 cmd 窗口）。
+  - 根因：之前 spawn 虽设了 `windowsHide:true`，但 `asr.localVenv` 指向的 `Scripts/python.exe` 是 venv **launcher**（如 uv 生成，约 262KB），它会 re-exec 到 `pyvenv.cfg` 里的 base 真解释器；re-exec 新建的控制台窗口不在 Node `windowsHide` 的管辖范围（`windowsHide` 只作用于直接子进程），所以每次都弹。此外原 `detached:true` 在 Windows 会分配独立控制台，与 `windowsHide` 冲突且对 re-exec 无效。
+  - 修复：`resolveAsrPython()` 把 launcher 解析成 `pyvenv.cfg` 指向的 base 真 `python.exe` 再 spawn，终点进程不再 re-exec，`windowsHide` 直接生效；去掉 `detached`、显式加 `CREATE_NO_WINDOW(0x08000000)`。`asr_sidecar.py` 本身用 `pythonw` + 日志文件，`asr_mode.py` 用 stdbuf，已规避二次弹窗。
+- 顺带修复：自动拉起的侧车子进程此前**未透传任何代理变量**，走代理的部署里 funasr/sherpaOnnx 首次下载模型会卡死（用户反馈的次要问题）。现在 spawn env 在最小环境之外补充 `HTTPS_PROXY/HTTP_PROXY/https_proxy/http_proxy/NO_PROXY/no_proxy`（仍不含任何密钥，QQ_ACCESS_TOKEN / 各 API Key 不外泄）。
+- 提示：若仍想彻底杜绝任何弹窗，可在控制台把「ASR 模式」设为 `cloud` 并填「云端 ASR 网址」（连你自己用 `pythonw`/计划任务静默常驻的侧车，本扩展不再 spawn 子进程）；或把 `asr.localVenv` 直接指向 base runtime 的 `python.exe`（真解释器，无 launcher）。
+
 ## 0.6.43
 
 - 修复群监听白名单对 notice 类事件不生效（用户 2026-10-30 反馈：`groups` 已清空、群消息不再收，但群里的戳一戳仍会漏进来）。
