@@ -1,0 +1,1 @@
+修复 QQ 语音(SILK_V3)无法识别：内置 silk-wasm 解码，不再依赖 ffmpeg (0.6.42)

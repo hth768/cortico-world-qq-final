@@ -395,7 +395,7 @@ const rosterPanel: WebUiPanel = {
       const groupsInput = ui.textarea({
         value: groupsVal,
         rows: 3,
-        placeholder: '监听的群号，用空格或逗号分隔；留空=全部群',
+        placeholder: '监听的群号，用空格或逗号分隔；留空=不监听任何群',
         onChange: commitGroups,
         onCommit: commitGroups,
       });

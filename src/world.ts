@@ -1606,6 +1606,16 @@ export class QQWorld implements World {
 
   private async handleNotice(ev: OneBotMessage): Promise<void> {
     const host = this.host!;
+    // 白名单同样约束 notice 类事件（文件/撤回/进退群/戳一戳/表情回应）：
+    // 普通消息在 handleEvent 里已有 isListened 检查，但 notice 走的是独立入口，
+    // 此前没有这道闸——群关了之后 poke 等事件仍会漏进来。
+    const gid = Number(ev.group_id) || 0;
+    const uid = Number(ev.user_id) || 0;
+    if (gid) {
+      if (!this.isListened('group', gid)) return;
+    } else if (uid) {
+      if (!this.isListened('private', uid)) return;
+    }
     const t = ev.notice_type;
     if (t === 'group_upload' || t === 'private_file') {
       const kind = t === 'group_upload' ? 'group' : 'private';

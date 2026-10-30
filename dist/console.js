@@ -349,7 +349,7 @@ var rosterPanel = {
       const groupsInput = ui.textarea({
         value: groupsVal,
         rows: 3,
-        placeholder: "\u76D1\u542C\u7684\u7FA4\u53F7\uFF0C\u7528\u7A7A\u683C\u6216\u9017\u53F7\u5206\u9694\uFF1B\u7559\u7A7A=\u5168\u90E8\u7FA4",
+        placeholder: "\u76D1\u542C\u7684\u7FA4\u53F7\uFF0C\u7528\u7A7A\u683C\u6216\u9017\u53F7\u5206\u9694\uFF1B\u7559\u7A7A=\u4E0D\u76D1\u542C\u4EFB\u4F55\u7FA4",
         onChange: commitGroups,
         onCommit: commitGroups
       });
