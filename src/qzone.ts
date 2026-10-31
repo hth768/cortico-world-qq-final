@@ -37,6 +37,17 @@ export interface QZoneConfig {
   autoReplyComments: QZoneAutoReplyConfig;
 }
 
+export interface QZoneEventEnvelope {
+  type: string;
+  /** 必填：事件时间戳（ISO）。漏填会让 core event-store 按时间窗检索失准、消息行缺 [HH:MM]。 */
+  ts: string;
+  origin?: string;
+  source?: string;
+  senderKey?: string;
+  text?: string;
+  meta?: Record<string, unknown>;
+}
+
 export interface QZonePosterOptions {
   cfg: QZoneConfig;
   log: (...a: unknown[]) => void;
@@ -45,8 +56,8 @@ export interface QZonePosterOptions {
   getContext: () => string;
   getRecentImageUrl: () => string | null;
   isPaused: () => boolean;
-  /** 评论 ingestion：把评论作为外部事件喂给框架（沉淀记忆）。 */
-  pushEvent: (e: unknown) => void;
+  /** 评论 ingestion：把评论作为外部事件喂给框架（沉淀记忆）。类型收紧为带 ts 的 envelope，漏字段编译期即报错。 */
+  pushEvent: (e: QZoneEventEnvelope) => void;
   /** 由 world 注入：把"请主模型发一条动态/回一条评论"的请求交给主模型（事件驱动，不再用第二模型）。 */
   requestLLM: (nudge: string, kind: 'post' | 'reply', meta?: Record<string, unknown>) => void;
   identity: () => QQIdentity;
@@ -110,7 +121,7 @@ export class QZonePoster {
   private readonly getContext: () => string;
   private readonly getRecentImageUrl: () => string | null;
   private readonly isPaused: () => boolean;
-  private readonly pushEvent: (e: unknown) => void;
+  private readonly pushEvent: (e: QZoneEventEnvelope) => void;
   private readonly requestLLM: (nudge: string, kind: 'post' | 'reply', meta?: Record<string, unknown>) => void;
   private readonly identity: () => QQIdentity;
 
@@ -353,6 +364,7 @@ export class QZonePoster {
       type: 'qq.qzone.comment',
       origin: 'external',
       source: 'qq',
+      ts: new Date().toISOString(),
       senderKey: `qzone:${tid}`,
       text: `QQ空间评论 ${p.operatorNick ? '(' + p.operatorNick + ')' : ''}：${p.text ?? ''}`,
       meta: { conv: `qzone:${tid}`, tid, commentId },

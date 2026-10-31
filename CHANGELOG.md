@@ -2,6 +2,14 @@
 
 本文件记录 cortico-world-qq-final 每个版本的改动，供扩展市场的「更新说明」直接读取。
 
+## 0.6.45
+
+- 修复 0.6.44 引入的 ASR 侧车回归（用户 2026-10-31 反馈：uv 造的 venv 下 `resolveAsrPython()` 把 python 换成 base 后，子进程脱离 venv 的 `site-packages`，import 依赖失败、exit code 2，语音转写整条不可用）。
+  - 根因：`resolveAsrPython()` 之前**无条件**把 venv 的 `Scripts/python.exe` 换成 `pyvenv.cfg` 里的 base。但 uv 造的 venv 其 `Scripts/python.exe` 本身就是**真解释器**（不 re-exec、不弹窗），换成 base 反而丢了 venv 的 `site-packages`；只有标准 `python -m venv` 生成的才是 launcher（会 re-exec 弹窗，才需要替换）。
+  - 修复：`resolveAsrPython()` 仅在 venv 的 `python.exe` 文件很小（≤1MB，判定为 launcher）时才替换为 base；并在 spawn 子进程时显式补 `VIRTUAL_ENV` 与 `PYTHONPATH`（指向 venv 的 `Lib/site-packages`），确保即便替换成 base 真解释器也能找到依赖。弹窗修复（0.6.44 初衷）仍保留：launcher 会被解析、且 `detached` 已去除 + `CREATE_NO_WINDOW`。
+- 修复空间/主动说话事件缺 `ts`（用户 2026-10-31 读源码反馈：缺 `ts` 会让 core `event-store` 按时间窗检索失准、分片边界变 NaN、消息行缺 `[HH:MM]`）。补三处：`qq.qzone.comment`（`src/qzone.ts`）、`qq.qzone.reply`/`qq.qzone.post`（world.ts 的 `requestLLM` 回调）、`qq.proactive`（world.ts 的 `requestSpeech` 回调）。顺带将 `QZonePoster.pushEvent` 参数类型由 `(e: unknown)=>void` 收紧为带 `ts` 的 `QZoneEventEnvelope`，以后漏字段编译期即报错（原 `as never` 绕过了类型检查才让这 bug 漏过）。
+- 修复关机误报假 P0（用户 2026-10-31 反馈：QQ 未连接时，从托盘正常退出 Coopanion 每次都多一条 `[P0] 外部状态未确认结束:NapCat 连接`）。`shutdownVerification()` 未连接时原返回 `still-live`，现改为两种都 `verified-ended`（连着时 WS 会关、没连着本就无外部状态，都是干净结束），未连接时不再附加 `manualAction`。
+
 ## 0.6.44
 
 - 修复 Windows 下「拉起 ASR 侧车每次弹黑框控制台」（用户 2026-10-30 反馈，截图复现：qq-final 自动拉 `asr_sidecar.py` 时弹出黑色 cmd 窗口）。

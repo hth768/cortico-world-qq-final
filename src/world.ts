@@ -1,11 +1,11 @@
 import { spawn, type ChildProcess } from 'node:child_process';
-import { existsSync, readFileSync, writeFileSync, readdirSync, openSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, readdirSync, openSync, statSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { createConnection, isIP } from 'node:net';
 import { type BlobInput, type EventEnvelope, type Language, type Logger, type PromptDocDecl, type ToolCallContext, type ToolDef, type ToolSpec, type World, type WorldWebUiDecl, type WorldHost, type WorldLamp, type WorldPanelDecl, type WorldStreamSocket } from 'cortico/core/types.ts';
 import { shortTime } from 'cortico/core/util.ts';
 import { OneBotDriver } from './driver.ts';
-import { QZonePoster, type QZoneConfig } from './qzone.ts';
+import { QZonePoster, type QZoneConfig, type QZoneEventEnvelope } from './qzone.ts';
 import { QQ_CONFIG_GROUP, QQ_VOICE_GROUP, QQ_ASR_GROUP, QQ_DEFAULTS, normalizeConfig, toIds, type QQConfigSection, type QQWorldConfig } from './config.ts';
 import { transcribeRecord, transcribeAudioBytes, synthesizeVoice, checkVoiceDeps, voiceReady, splitIntoSentences, type RuntimeVoiceCfg } from './voice.ts';
 import { isAbsolute, join, dirname } from 'node:path';
@@ -424,7 +424,7 @@ export class QQWorld implements World {
       getContext: () => this.qzoneContext(),
       getRecentImageUrl: () => this.recentImageUrl(),
       isPaused: () => this.host?.isPaused?.() ?? false,
-      pushEvent: (e) => this.host.pushEvent(e as never, { trigger: 'piggyback' }),
+      pushEvent: (e: QZoneEventEnvelope) => { void this.host.pushEvent(e as never, { trigger: 'piggyback' }); },
       // 事件驱动：把"请主模型发动态/回评论"的请求交给主模型（不再用第二模型）。
       // qzone 事件携带不可信外部内容（评论原文 / 群聊取材）：origin 用 'external' 不被当可信指令，
       // 并用 trigger:'flush' 保证唤醒主模型回合；不可信原文已放入 meta（数据），text 只放指令。
@@ -434,6 +434,7 @@ export class QQWorld implements World {
             type: kind === 'reply' ? 'qq.qzone.reply' : 'qq.qzone.post',
             origin: 'external',
             source: SOURCE,
+            ts: eventTs(this.config.timezone),
             text: nudge,
             meta: meta ?? {},
           } as never,
@@ -500,6 +501,7 @@ export class QQWorld implements World {
           type: 'qq.proactive',
           origin: 'internal',
           source: SOURCE,
+          ts: eventTs(this.config.timezone),
           text: nudge,
           senderKey: address,
           meta: { conv: address },
@@ -2218,14 +2220,18 @@ export class QQWorld implements World {
     return { python, script, modelPath, engine: asr.localEngine };
   }
 
-  /** 解析 venv launcher → base 真 python.exe。
-   *  venv 的 Scripts/python.exe 往往是 launcher（如 uv 生成，大小约 262KB），
-   *  它会 re-exec 到 base 真解释器；re-exec 新建的控制台窗口不在 Node spawn 的
-   *  windowsHide 控制范围——这就是「拉 ASR 侧车每次弹黑框」的根因（用户 2026-10-30 反馈）。
-   *  解析成 pyvenv.cfg 指向的 base 真 python.exe 后，spawn 它即无再 re-exec，
-   *  windowsHide 直接作用于终点 CreateProcess，不再弹窗。 */
+  /** 解析 venv launcher → base 真 python.exe，消除 re-exec 弹窗。
+   *  venv 的 Scripts/python.exe 有两种情形：
+   *  1) 真解释器（如 uv 造的 venv，直接复制/硬链接 base python，文件数 MB）：不 re-exec、不弹窗，
+   *     且无 re-exec 带来的 site-packages 脱离风险——直接用它即可（用户 2026-10-31 反馈：0.6.44 把
+   *     uv venv 的 python 换成 base 后，子进程脱离 venv 的 site-packages，import 失败 exit code 2）。
+   *  2) launcher（python -m venv 生成，约 100KB 的 stub）：会 re-exec 到 base 真解释器，
+   *     re-exec 新建的控制台窗口不在 Node windowsHide 管控内（0.6.44 初版反馈每次拉侧车弹黑框）。
+   *  仅在第 2 种（文件很小）时替换为 base 真 python.exe，并在 spawn 处显式补 VIRTUAL_ENV/PYTHONPATH。 */
   private resolveAsrPython(venvPython: string): string {
     try {
+      const st = statSync(venvPython);
+      if (st.size > 1_000_000) return venvPython; // 真解释器（如 uv venv）：不替换
       const dir = dirname(venvPython);
       const cfg = join(dir, '..', 'pyvenv.cfg');
       if (existsSync(cfg)) {
@@ -2268,12 +2274,22 @@ export class QQWorld implements World {
         const v = process.env[k];
         if (v) proxyEnv[k] = v;
       }
+      // 让子进程能找到 venv 的 site-packages：若 resolveAsrPython 把 launcher 换成了 base 真 python，
+      // 就不再经过 venv launcher 的激活机制，必须显式把 venv 的 site-packages 指给它，
+      // 否则 import funasr/sherpaOnnx 失败 → 子进程 exit code 2（用户 2026-10-31 反馈的 0.6.44 回归）。
+      // 即便未替换（uv venv 直接用真解释器），补上这两个变量也无害。
+      const venvRoot = dirname(dirname(info.python)); // Scripts/.. = venv 根
+      const sitePkgs = join(venvRoot, 'Lib', 'site-packages');
+      const hasVenv = existsSync(join(venvRoot, 'pyvenv.cfg'));
+      const pyPath = existsSync(sitePkgs)
+        ? sitePkgs + (process.env.PYTHONPATH ? path.delimiter + process.env.PYTHONPATH : '')
+        : (process.env.PYTHONPATH || '');
       this.asrSidecar = spawn(
         python,
         [info.script, String(port), '--engine', info.engine, '--model-dir', info.modelPath],
         {
           cwd: dirname(info.script),
-          // 只透传运行 python 所必需的最小环境 + 代理变量，避免把部署里的密钥（如 QQ_ACCESS_TOKEN / 各 API Key）泄露给侧车子进程。
+          // 只透传运行 python 所必需的最小环境 + 代理 + venv 路径，避免把部署里的密钥（如 QQ_ACCESS_TOKEN / 各 API Key）泄露给侧车子进程。
           env: {
             PATH: process.env.PATH || '',
             SYSTEMROOT: process.env.SYSTEMROOT || '',
@@ -2283,6 +2299,8 @@ export class QQWorld implements World {
             HOME: process.env.HOME || '',
             LANG: process.env.LANG || '',
             ...proxyEnv,
+            ...(hasVenv ? { VIRTUAL_ENV: venvRoot } : {}),
+            PYTHONPATH: pyPath,
           } as Record<string, string>,
           stdio: ['ignore', logf, logf],
           // detached:true 在 Windows 会分配独立控制台，与 windowsHide 冲突且对 re-exec 无效；去掉它。
@@ -3771,9 +3789,12 @@ export class QQWorld implements World {
       {
         key: 'qq-conn',
         label: 'NapCat 连接',
-        status: this.connected ? ('verified-ended' as const) : ('still-live' as const),
-        detail: this.connected ? '已连接，停止后连接将关闭。' : '未连接。',
-        manualAction: '在 NapCat 中停止 OneBot 连接或关闭本扩展。',
+        // 无论已连接还是未连接，停止本 World 后外部状态都已干净结束：
+        // 连着时 WS 会被关掉，没连着时本来就没有外部状态。两种都算 verified-ended，
+        // 否则未连接时返回 still-live 会每次关机都报一条假 P0，淹没真正的告警（用户 2026-10-31 反馈）。
+        status: 'verified-ended' as const,
+        detail: this.connected ? '已连接，停止后连接将关闭。' : '未连接，无外部状态需要结束。',
+        ...(this.connected ? { manualAction: '在 NapCat 中停止 OneBot 连接或关闭本扩展。' } : {}),
       },
     ];
   }
