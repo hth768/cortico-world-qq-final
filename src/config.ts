@@ -52,6 +52,8 @@ export interface QQWorldConfig {
   privates: string | number[];
   /** 私聊聚合窗口（ms），fat-fish PRIVATE_AGGREGATION_WINDOW。 */
   privateAggregationWindow: number;
+  /** passive 保持自动投递；active 完全主动查收；hybrid 仅私聊/@自己/戳自己实时投递。 */
+  receiveMode: 'passive' | 'active' | 'hybrid';
   /** 连续消息最大间隔（ms），超出视为新主题（fat-fish MAX_SEQUENCE_GAP）。 */
   maxSequenceGap: number;
   /** 引用回看窗口（秒），fat-fish REPLY_MAX_GAP_SEC。 */
@@ -281,6 +283,7 @@ export const QQ_DEFAULTS: QQWorldConfig = {
   groups: [],
   privates: [],
   privateAggregationWindow: 0,
+  receiveMode: 'hybrid',
   maxSequenceGap: 8000,
   replyMaxGapSec: 600,
   maxMessageBytes: 1500,
@@ -460,6 +463,10 @@ export const QQ_CONFIG_GROUP: ConfigGroup = {
       'worlds.qqbot.token': { type: 'string', title: 'OneBot Token', 'x-hot': false, description: '【反向连接必填】桌宠启动时会自动生成一串随机 Token 并保存到 dataDir/reverse-token.txt（跨重启不变），就显示在下方输入框里。把它整串复制到协议端「设置反向客户端」的鉴权 Token，然后在协议端点「保存连接」，即可连上。仅当连接模式为 forward（正向）时，才改填协议端「设置正向服务器」里那个 Token。' },
       'worlds.qqbot.groups': { type: 'string', title: '监听群', 'x-hot': true, description: '监听的群号，用空格或逗号分隔；空=不监听任何群（白名单模式，与私聊一致）。改完即时生效，不用重启。' },
       'worlds.qqbot.privates': { type: 'string', title: '监听私聊', 'x-hot': true, description: '监听的私聊对方 QQ 号，用空格或逗号分隔。改完即时生效，不用重启。' },
+      'worlds.qqbot.receiveMode': {
+        type: 'string', title: '消息接收模式', enum: ['hybrid', 'active', 'passive'], 'x-hot': false,
+        description: 'hybrid=混合（默认），私聊/@自己/戳自己实时投递，其余主动查收；active=主动查收，私聊、群聊、@、戳一戳和空间评论只存未读箱，不逐条唤醒；passive=被动投递，沿用原自动投递行为。主动模式同时暂停随机主动闲聊和空间自动发帖/回复；明确设置的闹钟仍生效。未读箱没有默认定时唤醒，可由 bot 通过 qq_inbox 预约一次查收提醒。改完重启扩展。',
+      },
       'worlds.qqbot.deliverImageAttachments': { type: 'boolean', title: '图片作为模型附件', 'x-hot': true, description: '开启时把收到的图片直接作为附件喂给主模型（主模型需支持看图）。这是默认的看图路径；「辅助视觉」是另一条用独立 VLM 描述图片的路，两条同时开会重复花钱，主模型能看图时就留着这个、关掉辅助视觉。' },
       'worlds.qqbot.emojiDir': { type: 'string', title: '表情包目录', 'x-hot': false, description: '本地表情包图片目录（相对扩展或绝对路径），供发送 [表情包:文件名] 标记。' },
       'worlds.qqbot.imageDir': { type: 'string', title: '图片库目录', 'x-hot': false, description: '本地图片库目录（相对扩展或绝对路径），与表情包目录分开，供发送 [图片:文件名] 标记。' },
@@ -650,6 +657,7 @@ export function normalizeConfig(raw: QQConfigSection): QQWorldConfig {
   c.groups = toIds(c.groups);
   c.privates = toIds(c.privates);
   if (typeof c.privateAggregationWindow !== 'number') c.privateAggregationWindow = QQ_DEFAULTS.privateAggregationWindow;
+  if (!['passive', 'active', 'hybrid'].includes(c.receiveMode as string)) c.receiveMode = QQ_DEFAULTS.receiveMode;
   if (typeof c.maxSequenceGap !== 'number') c.maxSequenceGap = QQ_DEFAULTS.maxSequenceGap;
   if (typeof c.replyMaxGapSec !== 'number') c.replyMaxGapSec = QQ_DEFAULTS.replyMaxGapSec;
   if (typeof c.maxMessageBytes !== 'number') c.maxMessageBytes = QQ_DEFAULTS.maxMessageBytes;

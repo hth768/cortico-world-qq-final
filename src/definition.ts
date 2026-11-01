@@ -6,6 +6,10 @@ import { qqDefaults, qqTimezoneOptions, type QQConfigSection } from './config.ts
 
 /** 每个工具一句给人看的话;市场与扩展页按界面语言取。 */
 const TOOL_SUMMARIES: Record<string, DescribeText> = {
+  qq_inbox: {
+    zh: 'QQ 主动查收：看积压、按会话和条数读取、预约或取消一次查收提醒。',
+    en: 'QQ inbox: inspect unread counts, read a chosen conversation, or schedule/cancel a one-time check reminder.',
+  },
   qq_send: {
     zh: '回复 QQ 消息的唯一渠道:往群或私聊发一条消息,可引用回复、@人,由主模型决定是否转成语音。',
     en: 'The only way to answer a QQ message: send one to a group or private chat, with quoting, mentions, and an optional voice reply chosen by the main model.',
@@ -61,6 +65,10 @@ const TOOL_SUMMARIES: Record<string, DescribeText> = {
 };
 
 const EVENTS: EventDescribe[] = [
+  {
+    type: 'qq.inbox-check',
+    description: { zh: 'bot 自行预约的单次查收提醒，仅含积压数量，不含聊天正文；无未读不唤醒。', en: 'An explicitly scheduled one-time inbox reminder, containing counts only; silent when empty.' },
+  },
   {
     type: 'qq.message',
     description: {

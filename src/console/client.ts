@@ -81,7 +81,8 @@ function renderField(ctx: WebUiPanelContext, def: FieldDef, value: unknown, comm
     const v = def.enum.includes(String(value)) ? String(value) : def.enum[0];
     control = ui.select({
       value: v,
-      options: def.enum.map((e: string) => ({ value: e, label: e })),
+      options: def.enum.map((e: string) => ({ value: e, label: def.key === 'worlds.qqbot.receiveMode'
+        ? ({ passive: '被动投递', active: '主动查收（减少唤醒）', hybrid: '混合模式' }[e] ?? e) : e })),
       onChange: (v: string) => commit(v),
     });
   } else if (def.type === 'integer' || def.type === 'number') {

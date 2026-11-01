@@ -50,7 +50,7 @@ function renderField(ctx, def, value, commit) {
     const v = def.enum.includes(String(value)) ? String(value) : def.enum[0];
     control = ui.select({
       value: v,
-      options: def.enum.map((e) => ({ value: e, label: e })),
+      options: def.enum.map((e) => ({ value: e, label: def.key === "worlds.qqbot.receiveMode" ? { passive: "\u88AB\u52A8\u6295\u9012", active: "\u4E3B\u52A8\u67E5\u6536\uFF08\u51CF\u5C11\u5524\u9192\uFF09", hybrid: "\u6DF7\u5408\u6A21\u5F0F" }[e] ?? e : e })),
       onChange: (v2) => commit(v2)
     });
   } else if (def.type === "integer" || def.type === "number") {
