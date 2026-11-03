@@ -88,7 +88,7 @@ Cortico 的 **QQ（OneBot v11 / NapCat）** World 扩展。以 `fat-fish` 仓库
 | `vision.endpoint` / `vision.apiKeySecret` / `vision.model` | `""` | 开启辅助视觉后**三项必填**。密钥只写名字（如 `DEEPSEEK_API_KEY`），值放在部署密钥库（.env）里，由框架 `secret()` 读取 |
 | `vision.videoEnabled` | `false` | 视频理解开关；开启后把收到的视频保存到独立 `videoDir`，用 ASR 配置里的 ffmpeg 抽帧拼图 |
 | `vision.videoDir` | `videos` | 视频文件目录（相对扩展或绝对路径）；文件名由内容哈希生成，不保存来源 URL |
-| `vision.videoFrameIntervalSec` | `1` | 视频抽帧间隔，单位秒，默认一秒一帧 |
+| `vision.videoFrameIntervalSec` | `1` | 视频抽帧间隔，单位秒，默认一秒一帧；先裁剪到当前时间窗再抽帧，避免画面与声音错位 |
 | `vision.videoMaxFrames` | `12` | 每个时间窗最多抽帧数，抽帧后拼成一张 PNG 附件 |
 | `vision.videoSegmentSec` | `8` | 视频时间窗长度；每个时间窗单独拼图并配声音转写 |
 | `vision.videoMaxSegments` | `12` | 最多处理的视频时间窗数量（上限 24）；视频时长会被 ffprobe 探测，只处理实际时长范围内的时间窗，逐窗抽帧拼图 + 同窗音频转写 |
@@ -357,7 +357,7 @@ interface VoiceProvider {
 - `qq_sticker_tag`：修改某张已收藏表情包的标注——情感 `emotion` / 用处 `usage` / 短标签 `tag` / 显示名 `label`（只传想改的字段），改完立即持久化保存。自动标注不准（如情感是「未知」）或想按自己的习惯整理表情库时用它；先用 `qq_sticker_stats` 拿到真实文件名再调用。
 - `qq_view_image`：主动重新看一张刚收到的 QQ 图片（当被动视觉没拿到描述、或你想细看时）。不传 `url` 则看最近收到的一张，也可传 `url` 指定任意图片链接，返回图片的文字描述。
 - 引用图片：引用 QQ 消息时，引用里的图片会随当前事件作为视觉附件传递；主模型不支持图片时尝试辅助视觉。图片 URL 只接受 `http(s)`，不会把来源地址写进事件。
-- 视频理解：在「视觉」配置页打开 `vision.videoEnabled` 后，收到的视频会保存到独立 `videoDir`，文件名通过内容哈希生成并写入事件的 `videoFile` / `videoFiles` 字段。扩展使用 ASR 配置中的 `asr.ffmpegPath`（同一套 PATH 与仓库 `ffmpeg-static` 回退），用 ffprobe 探测真实时长后按 `videoSegmentSec` 切成时间窗（最多 `videoMaxSegments` 个、上限 24），在每个时间窗内按 `videoFrameIntervalSec` 抽帧拼图，并**按同一时间范围抽取声音交给 ASR**，画面拼图与同窗转写一起交给主模型；主模型支持图片时一次收到多张带时间范围的拼图附件，否则逐窗调用辅助视觉后汇总成时间轴。视频只接受 QQ 提供的 `http(s)` 地址，超过 `videoMaxBytes`、时间窗上限或处理失败时保持普通视频占位，不把来源地址或原文送进事件。
+- 视频理解：在「视觉」配置页打开 `vision.videoEnabled` 后，收到的视频会保存到独立 `videoDir`，文件名通过内容哈希生成并写入事件的 `videoFile` / `videoFiles` 字段。扩展使用 ASR 配置中的 `asr.ffmpegPath`（同一套 PATH 与仓库 `ffmpeg-static` 回退），用 ffprobe 探测真实时长后按 `videoSegmentSec` 切成时间窗（最多 `videoMaxSegments` 个、上限 24），在每个时间窗内按 `videoFrameIntervalSec` 抽帧拼图，并**按同一时间范围抽取声音交给 ASR**，画面拼图与同窗转写一起交给主模型；主模型支持图片时一次收到多张带时间范围的拼图附件，否则逐窗调用辅助视觉后汇总成时间轴。视频接受消息 `url` 或 `file` 字段中的公开 `http(s)` 地址；超过 `videoMaxBytes` 或下载失败时明确提示，已保存但抽帧/声音提取失败时提示检查 ffmpeg。仅有协议端本地路径或文件 ID 的视频仍无法下载，不读取该路径。时间轴最多处理 `videoMaxSegments` 个时间窗。
 
 ### 让 bot 收藏的表情在 QQ 里可见（同步到 QQ 收藏表情）
 默认 bot 收藏表情包只是把图片**下载到本机目录**发图用，并不会写进 QQ 自己的「收藏表情」。若想让你在 SnowLuma 拉起的 QQ 客户端里也能看到这些表情，开启设置 **「同步到 QQ 收藏表情」**（`worlds.qqbot.sticker.addToQQFavorites`）：
@@ -430,3 +430,5 @@ interface VoiceProvider {
 - 回评 action 名（NapCat/SnowLuma 为 `comment_qzone`，留 `auto` 即用内置默认）按版本不同可能变化，失败请在控制台改 `qzone.commentAction`。
 - `qq_qzone（action=feeds）` 返回好友动态正文（不含评论）；用 `action=detail`（`tid`+`uin`）拉取单条动态的全部评论——走 SnowLuma 的 `get_qzone_msg_detail`（用户实测可用；NapCat 不一定提供该接口，失败时 detail 会返回 error 提示）。feed 句柄字段在协议端叫 `key`，本扩展已映射为工具里的 `tid`。
 - 动态/评论文案由主模型（部署的 provider）生成，无独立配置项；开启自动动态/自动评论只需在控制台打开对应开关（需重启生效），由后台 tick / 评论事件触发主模型经本工具发布。
+
+接收普通文件时，上报直链下载失败会通过群/私聊文件 ID 刷新地址并重试一次；多文件消息逐个记录保存结果，失败文件明确标注未保存，不会使用后续文件的编号。文件资料库仅保存和管理文件，不代表已解析 PDF、Office 等文件正文。

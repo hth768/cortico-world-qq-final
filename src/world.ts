@@ -1457,6 +1457,7 @@ export class QQWorld implements World {
     }
 
     let text = renderIncoming(segs, { timezone: this.config.timezone, selfId, replyText, replyRef });
+    const originalText = text;
     this.log.info('HANDLE_IN kind=' + conv.kind + ' text=' + JSON.stringify(text).slice(0, 40));
     // 合并转发：异步展开内容作为补充事件（不阻塞主消息投递，对齐内置 lookupForward）
     const fwdSeg = segs.find((s) => s.type === 'forward');
@@ -1474,6 +1475,7 @@ export class QQWorld implements World {
 
     const videoFiles: string[] = [];
     const fileMetas: FileMeta[] = [];
+    const fileResults: (FileMeta | null)[] = [];
     for (const s of segs) {
       if (s.type === 'image' && (s.data as { url?: string }).url) {
         const url = (s.data as { url: string }).url!;
@@ -1511,10 +1513,15 @@ export class QQWorld implements World {
         }
       } else if (s.type === 'file') {
         const meta = await this.saveIncomingFile(ev, s.data as unknown as Record<string, unknown>);
+        fileResults.push(meta);
         if (meta) fileMetas.push(meta);
-      } else if (s.type === 'video' && (s.data as { url?: string }).url) {
+      } else if (s.type === 'video') {
         if (!this.config.vision.videoEnabled || !this.videos) continue;
-        const url = (s.data as { url: string }).url;
+        const url = [s.data.url, s.data.file].find((v) => typeof v === 'string' && isPublicFileUrl(v));
+        if (!url) {
+          text += '\n[视频未处理：协议端未提供可用的公开下载地址]';
+          continue;
+        }
         const result = await this.videos.saveAndExtractTimeline(url, {
           intervalSec: this.config.vision.videoFrameIntervalSec,
           segmentSec: this.config.vision.videoSegmentSec,
@@ -1522,10 +1529,15 @@ export class QQWorld implements World {
           maxSegments: this.config.vision.videoMaxSegments,
           audio: this.config.vision.videoAudioEnabled && this.config.asr.mode !== 'off',
         });
-        if (!result) continue;
+        if (!result) {
+          text += '\n[视频下载失败：请检查下载地址有效期、网络及大小上限]';
+          this.log.warn('收到视频但下载或保存失败');
+          continue;
+        }
         videoFiles.push(result.file);
         if (text) text += '\n';
         text += `[视频文件:${result.file}]`;
+        if (!result.segments.length) text += '\n[视频已保存但未能提取画面或声音，请检查 ffmpeg 配置及视频格式]';
         const mainCanSee = host.modelFacts.accepts('image/png');
         const timelineLines: string[] = [];
         const runtimeVoice = result.segments.some((seg) => seg.audioBytes) ? this.voiceRuntime() : null;
@@ -1583,12 +1595,10 @@ export class QQWorld implements World {
       }
     }
 
-    if (fileMetas.length) {
-      let i = 0;
-      text = text.replace(/\[文件\]/g, () => {
-        const m = fileMetas[i++];
-        return m ? `[文件:${m.file}]` : '[文件]';
-      });
+    if (fileResults.length) {
+      text = renderIncoming(segs, { timezone: this.config.timezone, selfId, replyText, replyRef,
+        fileNames: fileResults.map((m) => m?.file ?? null),
+      }) + text.slice(originalText.length);
     }
 
     const baseMeta = {
@@ -1773,7 +1783,7 @@ export class QQWorld implements World {
         origin: 'external',
         text: meta
           ? '收到一个文件，已保存到文件资料库；请用 qq_file(action=list) 查看资料。'
-          : '收到一个文件，但协议端未提供可下载地址；请用 qq_file(action=list) 查看已有资料。',
+          : '收到一个文件，但未取得下载地址或下载/保存失败（网络、大小上限、写入权限）；请用 qq_file(action=list) 查看已有资料。',
         senderKey: conv.address,
         meta: {
           conv: conv.address,
@@ -3883,11 +3893,11 @@ export class QQWorld implements World {
   }
 
   /** 从文件消息段/群文件通知中解析协议端提供的公开下载地址。绝不接受 file:// 或本机路径。 */
-  private async resolveIncomingFileUrl(ev: OneBotMessage, data: Record<string, unknown>): Promise<string | null> {
+  private async resolveIncomingFileUrl(ev: OneBotMessage, data: Record<string, unknown>, refresh = false): Promise<string | null> {
     const direct = [data.url, data.file].find((v) => typeof v === 'string' && isPublicFileUrl(v as string)) as string | undefined;
-    if (direct) return direct;
+    if (direct && !refresh) return direct;
     const id = String(data.file_id ?? data.id ?? data.file ?? ev.file?.file_id ?? ev.file?.id ?? '').trim();
-    if (!id || !this.driver) return null;
+    if (!id || /^https?:\/\//i.test(id) || !this.driver) return null;
     const groupId = ev.group_id ?? (ev.message_type === 'group' ? ev.target_id : undefined);
     const action = groupId ? 'get_group_file_url' : 'get_private_file_url';
     const params: Record<string, unknown> = groupId
@@ -3911,7 +3921,12 @@ export class QQWorld implements World {
     const url = await this.resolveIncomingFileUrl(ev, data);
     if (!url) return null;
     const name = typeof data.name === 'string' ? data.name : typeof data.file === 'string' ? data.file : 'file';
-    const result = await this.files.saveUrl(url, name);
+    let result = await this.files.saveUrl(url, name);
+    // 延迟查收时上报的直链可能已过期；用协议文件 ID 刷新一次，不无限重试。
+    if (!result.ok && [data.url, data.file].some((v) => v === url)) {
+      const refreshed = await this.resolveIncomingFileUrl(ev, data, true);
+      if (refreshed) result = await this.files.saveUrl(refreshed, name);
+    }
     if (!result.ok) this.log.warn('收到文件但保存失败', { error: result.error });
     return result.meta ?? null;
   }

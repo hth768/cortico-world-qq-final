@@ -192,3 +192,69 @@ test('撤销监听后不可读取，切换账号后不串号，切换被动模�
   f.world.identity.selfId = 10002;
   assert.equal(JSON.parse(await f.call({ action: 'peek' })).total, 0);
 });
+
+test('视频 file URL 进入时间轴处理，附件随主动查收返回；失败明确可见', async (t) => {
+  const f = fixture(t);
+  f.config.vision.videoEnabled = true;
+  const urls: string[] = [];
+  f.world.videos = { saveAndExtractTimeline: async (url: string) => {
+    urls.push(url);
+    return { file: 'video-123.mp4', segments: [{ index: 0, startSec: 0, endSec: 8, frameBytes: new Uint8Array([1]), audioBytes: null }] };
+  } };
+  await f.deliver(message(1, { message: [{ type: 'video', data: { file: 'https://example.com/v.mp4' } }] }));
+  const result = await f.call({ action: 'read', conversation: 'group:12345' });
+  assert.deepEqual(urls, ['https://example.com/v.mp4']);
+  assert.equal(result.blobs.length, 1);
+  assert.match(result.text, /视频片段.*0:00-0:08/);
+  f.world.videos.saveAndExtractTimeline = async () => null;
+  await f.deliver(message(2, { message: [{ type: 'video', data: { url: 'https://example.com/v.mp4' } }] }));
+  assert.match((await f.call({ action: 'read', conversation: 'group:12345' })).text, /视频下载失败/);
+  await f.deliver(message(3, { message: [{ type: 'video', data: { file: 'C:\\secret.mp4' } }] }));
+  assert.match((await f.call({ action: 'read', conversation: 'group:12345' })).text, /未提供可用的公开下载地址/);
+});
+
+test('多个文件部分失败不串位，正文中的文件占位文本保持原样', async (t) => {
+  const f = fixture(t);
+  f.world.saveIncomingFile = async (_ev: any, data: any) => data.file === 'good'
+    ? { file: 'file-0123456789abcdef.pdf', size: 1 } : null;
+  await f.deliver(message(1, { message: [
+    { type: 'text', data: { text: '原文[文件] A:' } },
+    { type: 'file', data: { file: 'bad' } },
+    { type: 'text', data: { text: ' B:' } },
+    { type: 'file', data: { file: 'good' } },
+  ] }));
+  const result = await f.call({ action: 'read', conversation: 'group:12345' });
+  assert.match(result.text, /原文\[文件\] A:\[文件未保存/);
+  assert.match(result.text, /B:\[文件:file-0123456789abcdef.pdf\]/);
+  assert.deepEqual(f.events[0].meta.fileFiles, ['file-0123456789abcdef.pdf']);
+});
+
+test('群和私聊文件直链失效后通过文件 ID 刷新，群 busid 保留', async (t) => {
+  const f = fixture(t);
+  const calls: any[] = [];
+  const downloads: string[] = [];
+  f.world.driver.callApi = async (action: string, params: any) => {
+    calls.push({ action, params }); return { url: 'https://example.com/fresh' };
+  };
+  f.world.files = { flush() {}, saveUrl: async (url: string) => {
+    downloads.push(url);
+    return url.endsWith('/old') ? { ok: false } : { ok: true, meta: { file: 'file-0123456789abcdef.pdf' } };
+  } };
+  for (const group of [true, false]) {
+    const ev = message(1, { group_id: group ? 12345 : undefined, message_type: group ? 'group' : 'private' });
+    assert.ok(await f.world.saveIncomingFile(ev, { file_id: 'id1', busid: 0, url: 'https://example.com/old', name: 'a.pdf' }));
+  }
+  assert.deepEqual(downloads, ['https://example.com/old', 'https://example.com/fresh', 'https://example.com/old', 'https://example.com/fresh']);
+  assert.equal(calls[0].action, 'get_group_file_url');
+  assert.deepEqual(calls[0].params, { group_id: 12345, file_id: 'id1', busid: 0 });
+  assert.equal(calls[1].action, 'get_private_file_url');
+  assert.equal(calls[1].params.user_id, 23456);
+});
+
+test('文件上传通知下载失败不再误报为协议未提供地址', async (t) => {
+  const f = fixture(t);
+  f.world.saveIncomingFile = async () => null;
+  await f.deliver(message(1, { post_type: 'notice', notice_type: 'group_upload', file: { id: 'id1', url: 'https://example.com/file' } }));
+  const result = await f.call({ action: 'read', conversation: 'group:12345' });
+  assert.match(result.text, /下载\/保存失败/);
+});

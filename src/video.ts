@@ -56,6 +56,7 @@ export class VideoStore {
   ) {
     this.dir = dir;
     this.ffmpegCandidates = ffmpegCandidates.filter(Boolean);
+    if (!this.ffmpegCandidates.length) this.ffmpegCandidates.push('ffmpeg');
     this.ffprobeCandidates = this.ffmpegCandidates.map((candidate) => {
       const lower = candidate.toLowerCase();
       if (lower.endsWith('ffmpeg.exe')) return `${candidate.slice(0, -10)}ffprobe.exe`;
@@ -207,14 +208,15 @@ export class VideoStore {
     const rows = Math.ceil(frames / columns);
     const fps = (1 / interval).toFixed(6).replace(/0+$/, '').replace(/\.$/, '') || '1';
     const filter = [
+      `trim=duration=${this.formatSeconds(durationSec)}`, 'setpts=PTS-STARTPTS',
       `fps=${fps}`,
+      `trim=end_frame=${frames}`,
       `scale=${FRAME_SIZE}:${FRAME_SIZE}:force_original_aspect_ratio=decrease`,
       `pad=${FRAME_SIZE}:${FRAME_SIZE}:(ow-iw)/2:(oh-ih)/2`,
       `tile=${columns}x${rows}:padding=4:margin=4`,
     ].join(',');
     const args = [
-      '-hide_banner', '-loglevel', 'error', '-i', filePath,
-      '-ss', this.formatSeconds(startSec), '-t', this.formatSeconds(durationSec), '-an',
+      '-hide_banner', '-loglevel', 'error', '-ss', this.formatSeconds(startSec), '-i', filePath, '-an',
       '-vf', filter, '-frames:v', '1', '-f', 'image2pipe', '-vcodec', 'png', 'pipe:1',
     ];
     const candidates = this.ffmpegCandidates.length ? this.ffmpegCandidates : ['ffmpeg'];
@@ -223,8 +225,8 @@ export class VideoStore {
 
   private extractSegmentAudio(filePath: string, startSec: number, durationSec: number): Promise<Uint8Array | null> {
     const args = [
-      '-hide_banner', '-loglevel', 'error', '-i', filePath,
-      '-ss', this.formatSeconds(startSec), '-t', this.formatSeconds(durationSec), '-vn',
+      '-hide_banner', '-loglevel', 'error', '-ss', this.formatSeconds(startSec), '-i', filePath,
+      '-t', this.formatSeconds(durationSec), '-vn',
       '-ac', '1', '-ar', '16000', '-f', 'wav', 'pipe:1',
     ];
     const candidates = this.ffmpegCandidates.length ? this.ffmpegCandidates : ['ffmpeg'];

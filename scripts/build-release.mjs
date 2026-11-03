@@ -41,7 +41,8 @@ await esbuild.build({
   format: 'esm',
   platform: 'node',
   target: 'node22',
-  external: ['cortico/*', 'ws', 'node:*'],
+  // 保留运行时依赖自己的加载器/资源目录（silk-wasm 含 CommonJS 与 WASM 资源）。
+  external: ['cortico/*', 'node:*', ...Object.keys(sourcePackage.dependencies || {})],
   minifyIdentifiers: true,
   minifySyntax: true,
   minifyWhitespace: true,

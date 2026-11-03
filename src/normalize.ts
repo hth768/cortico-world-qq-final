@@ -75,11 +75,12 @@ export const __resolveImageFileForTest = resolveImageFile;
 /** 把 OneBot 消息段数组渲染为对模型友好的纯文本（含引用/表情/@ 标注）。 */
 export function renderIncoming(
   segments: OneBotSegment[] | string | undefined,
-  ctx: { timezone: string; selfId: number; replyText?: string; replyRef?: string },
+  ctx: { timezone: string; selfId: number; replyText?: string; replyRef?: string; fileNames?: (string | null)[] },
 ): string {
   if (typeof segments === 'string') return segments;
   if (!segments || !Array.isArray(segments)) return '';
   const out: string[] = [];
+  let fileIndex = 0;
   if (ctx.replyText && ctx.replyRef) {
     out.push(`「引用 ${ctx.replyRef}${ctx.replyText ? '：' + ctx.replyText : ''}」`);
   }
@@ -106,7 +107,10 @@ export function renderIncoming(
       case 'file':
         // 文件名来自外部消息，不能原样拼进提示词；world 会在成功落盘后补充
         // 由内容哈希生成的固定文件名，未能下载时只保留中性占位。
-        out.push('[文件]');
+        if (ctx.fileNames) {
+          const file = ctx.fileNames[fileIndex++];
+          out.push(file ? `[文件:${file}]` : '[文件未保存：未取得下载地址或下载/保存失败]');
+        } else out.push('[文件]');
         break;
       case 'forward':
         out.push('[合并转发消息]');
