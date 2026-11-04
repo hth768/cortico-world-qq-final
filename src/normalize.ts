@@ -252,7 +252,7 @@ export interface SplitReplyOptions {
 
 /**
  * 把构建好的发送段拆成多条消息（对齐 fat-fish split_text_segments_by_sentence
- * + split_text_and_images）：文字按句标点拆分，face 跟随最后一条，image 独立成条；
+ * + split_text_and_images）：文字按句标点或换行拆分，face 跟随最后一条，image 独立成条；
  * 单条仍超 maxBytes 时再按字节硬切。splitBySentence=false 则整体一条。
  */
 export function splitReplyIntoMessages(segments: OneBotSegment[], opts: SplitReplyOptions): OneBotSegment[][] {
@@ -270,7 +270,7 @@ export function splitReplyIntoMessages(segments: OneBotSegment[], opts: SplitRep
         .join('');
       const faces = textParts.filter((s) => s.type === 'face');
       const sentences = fullText
-        .split(/(?<=[。！？!?；;])/)
+        .split(/(?<=[。！？!?；;])|\r\n|[\r\n]/)
         .map((s) => s.trim())
         .filter(Boolean);
       if (sentences.length <= 1) {
