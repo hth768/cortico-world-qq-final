@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, unlinkSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, extname } from 'node:path';
 import type { Logger } from 'cortico/core/types.ts';
 
@@ -45,6 +45,7 @@ interface Job {
   url: string;
   conv: string;
   summary: string;
+  manual?: boolean;
 }
 
 /**
@@ -123,6 +124,8 @@ export class StickerStore {
 
   /** 立即落盘（stop 时调用）。 */
   flush(): void {
+    clearTimeout(this.saveTimer);
+    this.saveTimer = undefined;
     this.save();
   }
 
@@ -205,6 +208,29 @@ export class StickerStore {
     return m;
   }
 
+  async saveOne(url: string, conv: string, patch: { label?: string; tag?: string; usage?: string }): Promise<StickerMeta | null> {
+    const m = await this.process({ url, conv, summary: '', manual: true });
+    if (!m || this.meta.get(m.hash) !== m) return null;
+    this.updateMeta(m.file, patch);
+    this.flush();
+    return m;
+  }
+
+  deleteOne(file: string): boolean {
+    const key = file.trim().replace(/^\[表情包:(.+)\]$/, '$1');
+    if (!/^sticker-[a-f0-9]{16}\.(png|jpg|jpeg|webp|bmp|gif|img)$/.test(key)) return false;
+    const m = [...this.meta.values()].find((entry) => entry.file === key);
+    if (!m) return false;
+    try {
+      unlinkSync(join(this.dir, key));
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'ENOENT') return false;
+    }
+    this.meta.delete(m.hash);
+    this.flush();
+    return true;
+  }
+
   private pump(): void {
     if (this.inflight >= 4) return;
     const job = this.queue.shift();
@@ -216,13 +242,14 @@ export class StickerStore {
     });
   }
 
-  private async process(job: Job): Promise<void> {
+  private async process(job: Job): Promise<StickerMeta | null> {
     try {
-      const bytes = await this.fetchBytes(job.url);
-      if (!bytes) return;
+      const bytes = await this.fetchBytes(job.url, job.manual);
+      if (!bytes?.length) return null;
       const hash = createHash('sha256').update(bytes).digest('hex');
 
       // 去重：已存在则只更新计数/来源，不重复落盘
+      const ann = !this.meta.has(hash) && this.vision.enabled ? await this.annotate(bytes) : { emotion: '未知', usage: '未知', tag: '' };
       const existing = this.meta.get(hash);
       if (existing) {
         existing.count++;
@@ -230,14 +257,13 @@ export class StickerStore {
         if (job.summary && !existing.summary) existing.summary = job.summary;
         if (!existing.sources.includes(job.conv)) existing.sources.push(job.conv);
         this.scheduleSave();
-        return;
+        return existing;
       }
 
       const ext = this.extOf(job.url, bytes);
       const file = `sticker-${hash.slice(0, 16)}${ext}`;
       writeFileSync(join(this.dir, file), bytes);
 
-      const ann = this.vision.enabled ? await this.annotate(bytes) : { emotion: '未知', usage: '未知', tag: '' };
       const label = this.cleanSummary(job.summary) || ann.tag || '表情包';
       const meta: StickerMeta = {
         hash,
@@ -269,8 +295,10 @@ export class StickerStore {
         }
       }
       this.scheduleSave();
+      return meta;
     } catch (e) {
-      this.log.warn('表情包处理失败', { err: String(e), url: job.url });
+      this.log.warn('表情包处理失败', { err: String(e) });
+      return null;
     }
   }
 
@@ -365,15 +393,26 @@ export class StickerStore {
     return (s || '').replace(/^\[表情\]/i, '').replace(/^\[emoji\]/i, '').trim();
   }
 
-  private async fetchBytes(url: string): Promise<Uint8Array | null> {
+  private async fetchBytes(url: string, manual = false): Promise<Uint8Array | null> {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), this.vision.timeoutMs);
     try {
-      const res = await fetch(url, { signal: ctrl.signal });
+      const res = await fetch(url, { signal: ctrl.signal, redirect: manual ? 'error' : 'follow' });
       if (!res.ok) return null;
-      const buf = Buffer.from(await res.arrayBuffer());
-      if (buf.byteLength > this.vision.maxBytes) return null;
-      return buf;
+      if (!res.body || Number(res.headers.get('content-length')) > this.vision.maxBytes) { ctrl.abort(); return null; }
+      const chunks: Uint8Array[] = [];
+      let size = 0;
+      const reader = res.body.getReader();
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          size += value.byteLength;
+          if (size > this.vision.maxBytes) { await reader.cancel(); return null; }
+          chunks.push(value);
+        }
+      } finally { reader.releaseLock(); }
+      return Buffer.concat(chunks, size);
     } catch {
       return null;
     } finally {

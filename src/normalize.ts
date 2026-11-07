@@ -1,5 +1,5 @@
 import { nowIso, shortTime } from 'cortico/core/util.ts';
-import { existsSync, readFileSync, realpathSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { faceName, faceIdByName } from './qface-map.ts';
 import type { OneBotSegment } from './types.ts';
@@ -54,7 +54,7 @@ function resolveEmojiFile(emojiDir: string, fname: string): string | null {
       const realRel = relative(realBase, realTarget);
       if (!realRel || realRel.startsWith('..') || isAbsolute(realRel)) continue;
 
-      return target;
+      if (statSync(realTarget).isFile()) return target;
     }
     return null; // 所有候选都不存在或越界
   } catch {
@@ -174,7 +174,7 @@ export function renderSegmentsPlain(segments: OneBotSegment[] | string | undefin
  *   - 其它 [..] → 普通文本（保留方括号原样）
  * emojiDir/imageDir 为空时不解析对应标记。
  */
-export function buildOutgoing(text: string, emojiDir = '', imageDir = '', imageTransport: 'path' | 'base64' = 'path'): OneBotSegment[] {
+export function buildOutgoing(text: string, emojiDir = '', imageDir = '', imageTransport: 'path' | 'base64' = 'path', stickerDir = emojiDir, onMissing?: (kind: string) => void): OneBotSegment[] {
   const imageSegment = (file: string): OneBotSegment | null => {
     if (imageTransport === 'base64') {
       try {
@@ -186,7 +186,7 @@ export function buildOutgoing(text: string, emojiDir = '', imageDir = '', imageT
     return { type: 'image', data: { file } };
   };
   const segments: OneBotSegment[] = [];
-  const re = /\[([^\[\]]{1,40})\]|@([^\s@]{1,30})/g;
+  const re = /\[((?:表情包:|图片:)[^\[\]]{0,200}|[^\[\]]{1,40})\]|@([^\s@]{1,30})/g;
   let last = 0;
   let m: RegExpExecArray | null;
   while ((m = re.exec(text)) !== null) {
@@ -194,26 +194,17 @@ export function buildOutgoing(text: string, emojiDir = '', imageDir = '', imageT
     if (m[1] !== undefined) {
       const inner = m[1];
       const whole = m[0];
-      if (inner.startsWith('表情包:')) {
-        const fname = inner.slice('表情包:'.length).trim();
-        if (emojiDir && fname) {
-          const p = resolveEmojiFile(emojiDir, fname);
-          if (p && existsSync(p)) {
-            const segment = imageSegment(p);
-            if (segment) segments.push(segment);
-          }
+      if (inner.startsWith('表情包:') || inner.startsWith('图片:')) {
+        const sticker = inner.startsWith('表情包:');
+        const fname = inner.slice(inner.indexOf(':') + 1).trim();
+        const dirs = sticker ? [stickerDir, emojiDir] : [imageDir];
+        let segment: OneBotSegment | null = null;
+        for (const dir of new Set(dirs.filter(Boolean))) {
+          const file = resolveEmojiFile(dir, fname);
+          if (file) { segment = imageSegment(file); break; }
         }
-        // 目录未配置 / 文件缺失 / 路径越界：丢弃该标记（不入群消息里的可读文本）
-      } else if (inner.startsWith('图片:')) {
-        const fname = inner.slice('图片:'.length).trim();
-        if (imageDir && fname) {
-          const p = resolveImageFile(imageDir, fname);
-          if (p && existsSync(p)) {
-            const segment = imageSegment(p);
-            if (segment) segments.push(segment);
-          }
-        }
-        // 图片库文件不存在或越界时静默丢弃该标记，不读取任意本机文件。
+        if (segment) segments.push(segment);
+        else onMissing?.(sticker ? '表情包' : '图片');
       } else if (/^表情\s*\d+(?:[:：][^\]]*)?$/.test(inner)) {
         const id = inner.match(/^表情\s*(\d+)/)![1];
         segments.push({ type: 'face', data: { id: Number(id) } });
@@ -237,7 +228,7 @@ export function buildOutgoing(text: string, emojiDir = '', imageDir = '', imageT
     last = re.lastIndex;
   }
   if (last < text.length) segments.push({ type: 'text', data: { text: text.slice(last) } });
-  if (segments.length === 0) segments.push({ type: 'text', data: { text } });
+  if (segments.length === 0 && !last) segments.push({ type: 'text', data: { text } });
   return segments;
 }
 

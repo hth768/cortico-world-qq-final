@@ -258,3 +258,68 @@ test('文件上传通知下载失败不再误报为协议未提供地址', async
   const result = await f.call({ action: 'read', conversation: 'group:12345' });
   assert.match(result.text, /下载\/保存失败/);
 });
+
+test('手动收藏指定消息的第 N 张图片，与自动收藏去重、标注和发送共用同一库', async (t) => {
+  const { StickerStore } = await import('../src/sticker.ts');
+  const { existsSync, mkdirSync, writeFileSync } = await import('node:fs');
+  const f = fixture(t, 'active', { imageTransport: 'base64', sendIntervalMs: 0 });
+  const dir = f.world.dataDir;
+  const storeDir = join(dir, '收藏夹');
+  const store = new StickerStore(storeDir, { ...f.config.vision, enabled: false }, f.world.log, dir);
+  f.world.stickers = store;
+  f.world.stickerDirAbs = storeDir;
+  f.world.emojiDirAbs = join(dir, 'legacy');
+  mkdirSync(f.world.emojiDirAbs);
+  writeFileSync(join(f.world.emojiDirAbs, 'legacy.gif'), 'GIF89a');
+  f.config.sticker.enabled = false;
+  const downloads: string[] = [];
+  t.mock.method(globalThis, 'fetch', async (input: string) => {
+    downloads.push(String(input));
+    return new Response(Buffer.from('GIF89a'));
+  });
+  const media = [{ type: 'sticker', data: { url: 'https://cdn.example/a.gif' } }, { type: 'sticker', data: { url: 'https://cdn.example/b.gif' } }];
+  await f.deliver(message(77, { message: media }));
+  await f.call({ action: 'read', conversation: 'group:12345' });
+  const invoke = (args: any) => f.world.tools().find((t: any) => t.name === 'qq_sticker').handler(args, {});
+  const save = { action: 'save', message_id: 77, index: 2, conv: 'group:12345', label: '微笑' };
+  await invoke({ ...save, conv: 'private:23456' });
+  await invoke({ ...save, index: 3 });
+  assert.equal(downloads.length, 0);
+  assert.match(await invoke(save), /已收藏/);
+  assert.deepEqual(downloads, ['https://cdn.example/b.gif']);
+  const m = store.stats().recent[0];
+  assert.equal(m.label, '微笑');
+  const persisted = () => JSON.parse(readFileSync(join(dir, 'sticker-index.json'), 'utf8'));
+  assert.equal(persisted()[m.hash].file, m.file);
+  store.ingest('https://cdn.example/b.gif', 'group:12345', '');
+  for (let n=0; n<50 && m.count < 2; n++) await new Promise(r => setTimeout(r, 5));
+  assert.equal(m.count, 2);
+  assert.equal(store.size, 1);
+  const sent: any[] = [];
+  f.world.driver.callApi = async (_: string, args: any) => { sent.push(...args.message); return {message_id: 456}; };
+  await f.world.sendTo('private:23456', `[表情包:${m.file}]`);
+  await f.world.sendTo('private:23456', '[表情包:legacy.gif]');
+  assert.deepEqual(sent.map(s=>s.data.file), ['base64://R0lGODlh','base64://R0lGODlh']);
+  const failure = await f.world.sendTo('private:23456', '看看[表情包:missing.gif]');
+  assert.match(failure, /未发送/);
+  assert.equal(sent.length, 2);
+  await invoke({action:'delete',file:'../'+m.file});
+  assert.equal(store.size, 1);
+  assert.match(await invoke({action:'delete',file:m.file}), /已删除/);
+  assert.equal(existsSync(join(storeDir, m.file)), false);
+  assert.equal(store.size, 0);
+  assert.deepEqual(persisted(), {});
+});
+
+test('跨天查收与聚合私聊：正文显示每条原消息的 ISO 时间及配置时区', async (t) => {
+  const f = fixture(t, 'active', {timezone:'Asia/Shanghai'});
+  const time = Date.parse('2026-11-06T23:59:59+08:00')/1000;
+  await f.deliver(message(1, {time}));
+  const read = await f.call({action:'read', conversation:'group:12345'});
+  assert.match(read.text, /2026-11-06T23:59:59\.000\+08:00/);
+  const p = fixture(t, 'passive', {timezone:'Asia/Shanghai', privateAggregationWindow: 100});
+  for (let i=0;i<2;i++) await p.deliver(message(i+1,{time:time+i,message_type:'private',group_id:undefined}));
+  await new Promise(r=>setTimeout(r,150));
+  assert.equal(p.events.length, 1);
+  assert.match(p.events[0].text,/2026-11-06T23:59:59\.000\+08:00[\s\S]+2026-11-07T00:00:00\.000\+08:00/);
+});

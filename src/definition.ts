@@ -30,6 +30,10 @@ const TOOL_SUMMARIES: Record<string, DescribeText> = {
     zh: '普通文件资料库:保存收到的文件、查看文件名、修改标注、删除或发回 QQ。',
     en: 'File library: save received files, list filenames, edit annotations, delete, or send them back to QQ.',
   },
+  qq_sticker: {
+    zh: '从指定消息收藏一张表情包，或按完整文件名删除本地收藏。',
+    en: 'Save a single sticker from a received message, or delete a local sticker by filename.',
+  },
   qq_sticker_stats: {
     zh: '查看已收藏表情包的统计与真实文件名,发图前先取文件名。',
     en: 'List collected stickers with their real filenames, needed before replying with one.',

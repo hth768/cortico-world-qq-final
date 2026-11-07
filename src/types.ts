@@ -5,6 +5,7 @@ export type OneBotSegment =
   | { type: 'at'; data: { qq: number | string; name?: string } }
   | { type: 'face'; data: { id: number | string } }
   | { type: 'image'; data: { file: string; url?: string; summary?: string } }
+  | { type: 'sticker'; data: { file?: string; url?: string; summary?: string } }
   | { type: 'record'; data: { file: string; url?: string } }
   | { type: 'video'; data: { file: string; url?: string } }
   | { type: 'file'; data: { file: string; url?: string; name?: string } }

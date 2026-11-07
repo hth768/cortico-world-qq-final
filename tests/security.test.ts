@@ -50,7 +50,7 @@ test('表情包文件名解析不得逃出表情包目录', async () => {
   assert.ok(!js.includes(': string'), 'TS 注解未清理干净');
 
   const factory = new Function(
-    'isAbsolute', 'join', 'relative', 'resolve', 'sep', 'realpathSync', 'existsSync',
+    'isAbsolute', 'join', 'relative', 'resolve', 'sep', 'realpathSync', 'existsSync', 'statSync',
     `${js}\nreturn resolveEmojiFile;`,
   );
   const R = factory(
@@ -61,6 +61,7 @@ test('表情包文件名解析不得逃出表情包目录', async () => {
     path.sep,
     fs.realpathSync,
     fs.existsSync,
+    fs.statSync,
   ) as (dir: string, file: string) => string | null;
 
   // 用真实的临时目录验证放行行为

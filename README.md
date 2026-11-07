@@ -352,6 +352,7 @@ interface VoiceProvider {
 - `qq_file`：普通文件资料库。收到 OneBot 文件消息或 `group_upload` / `private_file` 通知时，若协议端提供公开 HTTP(S) 下载地址，就把文件保存到独立 `fileDir`（默认 `<扩展>/files`），文件名由内容哈希生成；协议端只提供文件 ID 时会尝试调用 `get_group_file_url` / `get_private_file_url`。下载地址拒绝 `file://`、本机和常见内网地址，原始文件名只作为清洗后的资料字段保存，不进入内部事件指令。
 - 文件库操作：`qq_file(action=list)` 查看哈希文件名和标注，`tag` 修改资料标签，`delete` 删除本地文件，`send` 配合事件 `meta.conv` 把库内文件发送到监听群或私聊。发送只接受 list 返回的固定文件名，并再次检查目录和符号链接；本机协议端直接使用 `upload_group_file` / `upload_private_file`，远程 SnowLuma 会先用 `upload_file_stream` 把文件分块传到协议端再发送，协议端不支持时会返回失败原因。
 
+- `qq_sticker(action=save, conv, message_id, index=1)`：从指定会话已接收的最近 50 条媒体消息（全局缓存，重启清空）中保存一张图，可传 label/tag/usage，不必开启自动收藏。`qq_sticker(action=delete, file)` 按完整文件名同时删除本地文件和索引，不删除 QQ 收藏表情。
 - `qq_sticker_stats`：查看已自动收藏的表情包统计——总数（及其中已同步到 QQ 收藏表情的张数）、按情感分布、最近若干条（含情感/用处/标签/文件名）。想给 QQ 回复发表情包图片时，**先调本工具拿到真实文件名**（返回里形如 `[表情包:xxx.jpg]`），再把整段 `[表情包:文件名]` 写进回复文本即可自动发出；不要编造不存在的文件名。
 - `qq_sticker_to_favorites`：把已收藏但还没进 QQ 收藏表情的表情包（开启开关前攒下的历史表情）批量补推到登录账号的 QQ「收藏表情」（custom face），让你能在 QQ 客户端里直接看到/使用。需先在设置开启「同步到 QQ 收藏表情」，且协议端支持 `add_custom_face`（如 SnowLuma）。
 - `qq_sticker_tag`：修改某张已收藏表情包的标注——情感 `emotion` / 用处 `usage` / 短标签 `tag` / 显示名 `label`（只传想改的字段），改完立即持久化保存。自动标注不准（如情感是「未知」）或想按自己的习惯整理表情库时用它；先用 `qq_sticker_stats` 拿到真实文件名再调用。
@@ -406,6 +407,8 @@ interface VoiceProvider {
 
 ## 发布构建
 
+npm 安装包以 `dist/index.js` 为入口，不包含 `src/` 是预期行为。[0.6.47 源码](https://github.com/hth768/cortico-world-qq-final/tree/f7f236c/src) · [0.6.48 源码](https://github.com/hth768/cortico-world-qq-final/tree/1414a1a/src)。
+
 仓库里的 `src/` 始终保留可维护源码，日常开发和测试使用它。发布前运行 `npm run build:release -- D:\\testing\\_qqfinal_release`，会在仓库外生成一个发布副本：入口切到压缩后的 `dist/index.js`，私有变量和函数名会被重新命名，注释和源码目录不会进入发布副本；工具名、配置键、事件名和 World 接口名称保持不变。发布副本需再运行 Cortico 的扩展检查后才能发布。
 
 ## 与 cortico-world-memory 的关系（可选，非依赖）
@@ -421,7 +424,7 @@ interface VoiceProvider {
 - **合并转发消息（不伪造身份）**：`qq_forward_by_id` 工具可按消息编号把本 bot 已接收/发出的多条消息合成**一张**合并转发卡片发出（卡片由本 bot 发出，node 身份只能是 bot 自己；卡片内每条消息用文本标注原始发送者昵称+QQ号并保留原文内容，不伪造任何身份）。需先开启设置 `worlds.qqbot.forwardByMessageId`（默认关闭），且仅能转发本 bot 本地记录内、属于目标会话的消息编号；依赖 OneBot 的 `send_forward_msg` 与 `get_msg`（NapCat/Lagrange/SnowLuma 等主流 OneBot v11 实现大多支持）。受 OneBot 限制，合并卡片无法把 node 身份设成原始发送者，故用「文本标注来源」保留出处。
 - 群成员名片为空时尝试补一次 `get_group_member_info`，但离线名片仍以 NapCat 推送为准。
 - 引用回复走实时 `get_msg`（与 fat-fish 一致），需要 NapCat 暴露该 API；引用库外消息也能正确拉取。
-- 表情包图片通过 `[表情包:文件名]` 发送，文件需放在 `emojiDir` 配置目录（默认 `<扩展>/emoji`）。文件名会先精确匹配；漏写或写错 `.gif`/`.png`/`.jpg`/`.jpeg`/`.webp` 扩展名时会自动尝试修正，仍找不到则该标记被丢弃，不报错。
+- 表情包图片通过 `[表情包:文件名]` 发送，文件需放在 `emojiDir` 配置目录（默认 `<扩展>/emoji`）。文件名会先精确匹配；漏写或写错 `.gif`/`.png`/`.jpg`/`.jpeg`/`.webp` 扩展名时会自动尝试修正，先查收藏目录，再查表情包目录；仍找不到则整条不发送，回执和日志提示原因。
 - 远程协议端（NapCat/SnowLuma 不在桌宠本机）发送表情包或图片时，`imageTransport=auto` 会把本地文件内联为 `base64://`，避免协议端因无法读取桌面端路径而报 `ENOENT`；同机部署可继续使用本地路径。
 - 中文表情名（如 `[旺柴]`/`[笑哭]`）按 fat-fish 的 `FACE_MAP` 映射到 face id；未知方括号文本原样保留。
 - 系统表情标记 `[表情22：白眼]` / `[表情22:白眼]`（数字为 QQ face id，支持全角/半角冒号与可选空格）会被解析成真正的 `face` 段发送。早期版本只认半角冒号，bot 照着入站的全角冒号写法输出时会变成"不存在的表情"文本，已于 0.1.8 修复。

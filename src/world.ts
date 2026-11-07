@@ -3,7 +3,6 @@ import { existsSync, readFileSync, writeFileSync, readdirSync, openSync, statSyn
 import { randomBytes } from 'node:crypto';
 import { createConnection, isIP } from 'node:net';
 import { type BlobInput, type EventEnvelope, type Language, type Logger, type PromptDocDecl, type ToolCallContext, type ToolDef, type ToolSpec, type World, type WorldWebUiDecl, type WorldHost, type WorldLamp, type WorldPanelDecl, type WorldStreamSocket } from 'cortico/core/types.ts';
-import { shortTime } from 'cortico/core/util.ts';
 import { OneBotDriver } from './driver.ts';
 import { QZonePoster, type QZoneConfig, type QZoneEventEnvelope } from './qzone.ts';
 import { QQ_CONFIG_GROUP, QQ_VOICE_GROUP, QQ_ASR_GROUP, QQ_DEFAULTS, normalizeConfig, toIds, type QQConfigSection, type QQWorldConfig } from './config.ts';
@@ -143,6 +142,8 @@ export class QQWorld implements World {
   /** 自己发出的消息索引（message_id → 会话），用于引用回复自己刚发的消息。 */
   private readonly knownMessages = new Map<string, { conv: string; ts: number }>();
   /** 最近收到的图片 URL 缓冲（供 qq_view_image 主动重看，无需事件里带 URL）。 */
+  // 只缓存本账号已实际处理过的最近 50 条媒体消息，按会话和 QQ 消息号定位。
+  private readonly stickerSources = new Map<string, (string | null)[]>();
   private readonly recentImages: Array<{ url: string; conv: string; at: number }> = [];
   private vision: Vision;
   private videos: VideoStore | null = null;
@@ -895,6 +896,7 @@ export class QQWorld implements World {
       this.stateSaveTimer = undefined;
     }
     this.saveState();
+    this.stickerSources.clear();
     this.stickers?.flush();
     this.images?.flush();
     if (this.reminderTimer) clearInterval(this.reminderTimer);
@@ -1437,6 +1439,17 @@ export class QQWorld implements World {
     const segs: OneBotSegment[] =
       typeof ev.message === 'string' ? [{ type: 'text', data: { text: ev.message } }] : (ev.message ?? []);
     const selfId = this.identity?.selfId ?? 0;
+    if (ev.message_id != null) {
+      const key = `${selfId}/${conv.address}/${ev.message_id}`;
+      this.stickerSources.delete(key);
+      const urls = segs.filter((seg) => seg.type === 'image' || seg.type === 'sticker').map((seg) => {
+        const data = seg.data as { url?: string; file?: string };
+        return [data.url, data.file].find((url) => typeof url === 'string' && isPublicFileUrl(url)) ?? null;
+      });
+      if (urls.length) this.stickerSources.set(key, urls);
+      if (this.stickerSources.size > 50) this.stickerSources.delete(this.stickerSources.keys().next().value!);
+    }
+
     const atMe = segs.some((s) => s.type === 'at' && Number((s as { data: { qq: string } }).data.qq) === selfId);
 
     // 引用回复
@@ -1616,14 +1629,13 @@ export class QQWorld implements World {
       ...(fileMetas.length ? { fileFiles: fileMetas.map((m) => m.file), fileMeta: fileMetas.map((m) => ({ file: m.file, size: m.size, label: m.label, tag: m.tag, usage: m.usage })) } : {}),
     };
 
+    const sendClock = eventTs(this.config.timezone, new Date((ev.time ?? Date.now() / 1000) * 1000));
     // 聚合事件当前只保存文本；带视频帧附件时直接投递，确保附件随本条消息到达模型。
     if (!manual && conv.kind === 'private' && this.config.privateAggregationWindow > 0 && !videoFiles.length && !blobs.length) {
-      this.aggregatePrivate(conv, sender, text, blobs, baseMeta);
+      this.aggregatePrivate(conv, sender, ev.message_id != null ? `#${ev.message_id} ${text}` : text, blobs, baseMeta, sendClock);
       return;
     }
 
-    let sendClock = '';
-    try { sendClock = shortTime(this.config.timezone, new Date((ev.time ?? Date.now() / 1000) * 1000)); } catch (e) { this.log.warn('shortTime FAIL ' + String(e)); }
     const senderTag = `${sender.name}(QQ:${sender.userId})`;
     const channelPrefix = conv.kind === 'group'
       ? `【QQ群 ${conv.label}（群号 ${conv.id}） ${sendClock}】${senderTag}`
@@ -1638,7 +1650,7 @@ export class QQWorld implements World {
     try {
       await host.pushEvent({
         type: 'qq.message',
-        ts: eventTs(this.config.timezone, new Date((ev.time ?? Date.now() / 1000) * 1000)),
+        ts: sendClock,
         source: SOURCE,
         origin: 'external',
         text: `${channelPrefix}：${idTag}${text}`,
@@ -1653,11 +1665,11 @@ export class QQWorld implements World {
     }
   }
 
-  private aggregatePrivate(conv: Conv, sender: QQSenderBrief, text: string, blobs: BlobInput[], meta: Record<string, unknown>): void {
+  private aggregatePrivate(conv: Conv, sender: QQSenderBrief, text: string, blobs: BlobInput[], meta: Record<string, unknown>, sendClock: string): void {
     const host = this.host!;
     const now = Date.now();
     const win = this.config.privateAggregationWindow;
-    const senderTag = `${sender.name}(QQ:${sender.userId})`;
+    const senderTag = `【QQ私聊 ${sendClock}】${sender.name}(QQ:${sender.userId})`;
     const pend = conv.pendingAggregatedText;
     if (pend && now - pend.firstAt < win) {
       // 仍在窗口内：累积到暂存文本，已排定的到期冲刷计时器保持不变
@@ -2217,7 +2229,13 @@ export class QQWorld implements World {
       }
     }
 
-    const outgoing = buildOutgoing(text, this.emojiDirAbs, this.imageDirAbs, this.outgoingImageTransport());
+    const missing: string[] = [];
+    const outgoing = buildOutgoing(text, this.emojiDirAbs, this.imageDirAbs, this.outgoingImageTransport(), this.stickerDirAbs, (kind) => missing.push(kind));
+    if (missing.length) {
+      const reason = `本条未发送：${missing.length} 个${[...new Set(missing)].join('/')}标记无法解析或读取，请核对资料库文件名与目录。`;
+      this.log.warn(reason, { address });
+      return QQWorld.SEND_FAILED + reason;
+    }
     if (atQQs && atQQs.length) {
       for (const qq of atQQs) outgoing.unshift({ type: 'at', data: { qq } });
     }
@@ -2232,6 +2250,7 @@ export class QQWorld implements World {
     let ok = 0;
     let total = 0;
     let limited = false;
+    let failedImages = 0;
     const ids: string[] = [];
     for (const segs of messages) {
       const valid = segs.filter((s) => !(s.type === 'text' && !((s.data as { text?: string }).text ?? '').trim()));
@@ -2247,6 +2266,7 @@ export class QQWorld implements World {
         this.recordGroupSpeak(address);
         this.rememberSentMessage(address, r, ids);
       } catch (e) {
+        if (valid.some((seg) => seg.type === 'image')) failedImages++;
         this.log.warn('发送失败', {
           err: String(e),
           address,
@@ -2268,7 +2288,7 @@ export class QQWorld implements World {
     }
     if (ok < total) {
       // 部分/全部失败：返回明确失败标记，便于 qq_send 识别并真实地报告"未发送"（而非误报"已发送"）。
-      return QQWorld.SEND_FAILED + `已向 ${this.convLabel(address)} 发送 ${ok}/${total} 段（有 ${total - ok} 段发送失败，可能因 NapCat 断连或图片获取失败）。${tail}`;
+      return QQWorld.SEND_FAILED + `已向 ${this.convLabel(address)} 发送 ${ok}/${total} 段（有 ${total - ok} 段未获协议端确认${failedImages ? `，其中 ${failedImages} 段是图片` : ''}，详见发送失败日志）。${tail}`;
     }
     return `已向 ${this.convLabel(address)} 发送 ${ok}/${total} 段。${tail}`;
   }
@@ -2700,7 +2720,7 @@ export class QQWorld implements World {
         if (res.startsWith(QQWorld.SEND_FAILED)) {
           // 如实报告"未发送"，不让模型/用户误以为已发出；failed:true 让模型知道可重试。
           return {
-            text: `未能发送（编号 ${id}）到 ${this.convLabel(address)}：${res.slice(QQWorld.SEND_FAILED.length)}\n（QQ 上没有收到这条消息，NapCat 可能断连或图片获取失败，稍后可重试）`,
+            text: `未能发送（编号 ${id}）到 ${this.convLabel(address)}：${res.slice(QQWorld.SEND_FAILED.length)}`,
             failed: true,
           };
         }
@@ -2887,6 +2907,41 @@ export class QQWorld implements World {
           default:
             return '未知 action；可选 list / tag / delete / send。';
         }
+      },
+    };
+
+    const stickerTool: ToolDef = {
+      name: 'qq_sticker',
+      tags: ['write', 'read'],
+      barrierAfter: true,
+      description: 'save：按会话和 QQ 消息号，从最近 50 条已接收的媒体消息中单张收藏，自动收藏关闭时也可用。delete：按 qq_sticker_stats 返回的完整文件名删除本地收藏，不影响 QQ 客户端收藏。',
+      parameters: {
+        type: 'object', properties: {
+          action: { type: 'string', enum: ['save', 'delete'] },
+          conv: { type: 'string', description: 'save：原消息会话 group:群号 或 private:QQ号。' },
+          message_id: { type: 'integer', description: 'save：原消息的 QQ 消息号。' },
+          index: { type: 'integer', minimum: 1, description: 'save：消息中第几张图/表情，从 1 起，默认 1。' },
+          file: { type: 'string', description: 'delete：要移除的完整收藏文件名。' },
+          label: { type: 'string' }, tag: { type: 'string' }, usage: { type: 'string' },
+        }, required: ['action'],
+      },
+      handler: async (args) => {
+        if (!this.stickers) return '表情库未初始化。';
+        if (args.action === 'delete') return typeof args.file === 'string' && this.stickers.deleteOne(args.file)
+          ? '已删除该本地表情包及其索引。' : '删除失败，请用 qq_sticker_stats 核对完整文件名。';
+        if (args.action !== 'save') return 'action 必须为 save 或 delete。';
+        const target = /^(group|private):([1-9]\d*)$/.exec(String(args.conv));
+        if (!target || !this.isListened(target[1] as 'group' | 'private', Number(target[2]))) return '请指定已监听的原消息会话。';
+        const index = args.index ?? 1;
+        if (typeof index !== 'number' || !Number.isSafeInteger(index) || index < 1 || !Number.isSafeInteger(args.message_id)) return '请核对消息号及图片序号（从 1 开始）。';
+        const url = this.stickerSources.get(`${this.identity?.selfId ?? 0}/${args.conv}/${args.message_id}`)?.[index - 1];
+        if (!url) return '该会话的最近媒体消息中没有这张可下载的图片。';
+        const m = await this.stickers.saveOne(url, String(args.conv), {
+          label: typeof args.label === 'string' ? args.label : undefined,
+          tag: typeof args.tag === 'string' ? args.tag : undefined,
+          usage: typeof args.usage === 'string' ? args.usage : undefined,
+        });
+        return m ? `已收藏：[表情包:${m.file}]` : '收藏失败：地址已过期、超出大小限制或无法保存。';
       },
     };
 
@@ -3513,7 +3568,7 @@ export class QQWorld implements World {
      * 组装所有工具。
      */
 
-    const tools: ToolDef[] = [forwardById, send, confirm, viewImage, imageTool, fileTool, stickerStats, stickerToFavorites, stickerTag, proactiveTool, qzoneTool, poke, reminderTool, adminTool, ...makeHistoryTools({
+    const tools: ToolDef[] = [forwardById, send, confirm, viewImage, imageTool, fileTool, stickerTool, stickerStats, stickerToFavorites, stickerTag, proactiveTool, qzoneTool, poke, reminderTool, adminTool, ...makeHistoryTools({
       getHost: () => this.host,
       sourceId: SOURCE,
       timezone: this.config.timezone,
