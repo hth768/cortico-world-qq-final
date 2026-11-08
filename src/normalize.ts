@@ -98,6 +98,11 @@ export function renderIncoming(
       case 'image':
         out.push(seg.data.summary ? `[图片：${seg.data.summary}]` : '[图片]');
         break;
+      case 'markdown':
+        // QQ 机器人（官方 bot / 第三方 bot）发的图文卡片是 markdown 段，
+        // 原样落到 default 只会剩一个 [markdown] 占位，正文全丢。
+        out.push(renderMarkdownSegments(String((seg.data as { content?: string }).content ?? '')) || '[卡片]');
+        break;
       case 'record':
         out.push('[语音]');
         break;
@@ -128,6 +133,18 @@ export function renderIncoming(
   return out.join('').trim();
 }
 
+/** 机器人 markdown 段 → 可读文字：图片语法→[图片]，链接只留文字，去掉标题/加粗标记。 */
+export function renderMarkdownSegments(content: string): string {
+  return String(content ?? '')
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, '[图片]')
+    .replace(/\[\]\([^)]*\)/g, '')
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
+    .replace(/^#{1,6}\s*/gm, '')
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
 function formatMention(qq: string, name: string | undefined, selfId: number): string {
   const id = Number(qq);
   if (id === selfId) return '@我';
@@ -149,6 +166,8 @@ export function renderSegmentsPlain(segments: OneBotSegment[] | string | undefin
           return `[表情${seg.data.id}]`;
         case 'image':
           return '[图片]';
+        case 'markdown':
+          return renderMarkdownSegments(String((seg.data as { content?: string }).content ?? '')) || '[卡片]';
         case 'record':
           return '[语音]';
         case 'video':
@@ -260,6 +279,8 @@ export function splitReplyIntoMessages(segments: OneBotSegment[], opts: SplitRep
         .map((s) => (s.data as { text?: string }).text ?? '')
         .join('');
       const faces = textParts.filter((s) => s.type === 'face');
+      // at 段必须跟着首条走：拆句时只重拼 text/face，@ 会被丢掉（表现为「发出去了但没亮红字」）
+      const ats = textParts.filter((s) => s.type === 'at');
       const sentences = fullText
         .split(/(?<=[。！？!?；;])|\r\n|[\r\n]/)
         .map((s) => s.trim())
@@ -278,6 +299,7 @@ export function splitReplyIntoMessages(segments: OneBotSegment[], opts: SplitRep
           }
         }
         if (faces.length && groups.length) groups[groups.length - 1].push(...faces);
+        if (ats.length && groups.length) groups[0].unshift(...ats);
       }
     }
   }
