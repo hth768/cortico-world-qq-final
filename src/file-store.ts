@@ -1,3 +1,4 @@
+import { IndexedMediaFiles } from './indexed-media.ts';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { extname, join, relative, resolve } from 'node:path';
@@ -47,6 +48,10 @@ export interface FileStoreResult { ok: boolean; meta?: FileMeta; error?: string;
  * list 返回的固定文件名。外部文件名只作清洗后的资料字段，不会被拼入内部事件。
  */
 export class FileStore {
+  private readonly indexedFiles: IndexedMediaFiles;
+  reconcile(legacy: string[]): Promise<void> {
+    return this.indexedFiles.reconcile(this.meta.values(), legacy, this.log);
+  }
   private readonly dir: string;
   private readonly maxBytes: number;
   private readonly log: Logger;
@@ -56,6 +61,7 @@ export class FileStore {
 
   constructor(dir: string, log: Logger, dataDir = '', maxBytes = DEFAULT_MAX_BYTES) {
     this.dir = dir;
+    this.indexedFiles = new IndexedMediaFiles('file', dir);
     this.log = log.child('file-store');
     this.indexFile = dataDir ? join(dataDir, 'file-index.json') : '';
     this.maxBytes = Number.isFinite(maxBytes) && maxBytes > 0 ? Math.min(maxBytes, DEFAULT_MAX_BYTES) : DEFAULT_MAX_BYTES;
@@ -68,10 +74,10 @@ export class FileStore {
     this.load();
   }
 
-  get size(): number { return this.meta.size; }
+  get size(): number { return this.indexedFiles.availableCount(this.meta.size); }
   flush(): void { this.save(); }
   recent(limit = 10): FileMeta[] {
-    return [...this.meta.values()].sort((a, b) => b.lastSaved - a.lastSaved).slice(0, Math.max(1, Math.min(50, Math.floor(limit)))).map((m) => ({ ...m }));
+    return [...this.meta.values()].filter(m => this.indexedFiles.available(m)).sort((a, b) => b.lastSaved - a.lastSaved).slice(0, Math.max(1, Math.min(50, Math.floor(limit)))).map((m) => ({ ...m }));
   }
 
   async saveUrl(url: string, name = '', patch: FilePatch = {}): Promise<FileStoreResult> {
@@ -86,6 +92,7 @@ export class FileStore {
     const file = `file-${hash.slice(0, 16)}${ext}`;
     const old = this.meta.get(hash);
     if (old) {
+      if (!this.indexedFiles.repair(old, bytes)) return { ok: false, error: '文件不可恢复。' };
       old.count += 1;
       old.lastSaved = Date.now();
       this.applyPatch(old, patch);
@@ -122,6 +129,7 @@ export class FileStore {
   delete(file: string): boolean {
     const m = this.find(file);
     if (!m) return false;
+    this.indexedFiles.forget(m.hash);
     this.meta.delete(m.hash);
     try { unlinkSync(this.safePath(m.file)); } catch { /* 索引仍删除 */ }
     this.scheduleSave();

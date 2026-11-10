@@ -53,6 +53,7 @@ export interface QZonePosterOptions {
   log: (...a: unknown[]) => void;
   dataDir: string;
   callApi: (action: string, params: Record<string, unknown>) => Promise<{ data?: unknown; error?: string }>;
+  resolveLibraryImage?: (kind: string, name: string) => string | null;
   getContext: () => string;
   getRecentImageUrl: () => string | null;
   isPaused: () => boolean;
@@ -118,6 +119,7 @@ export class QZonePoster {
   private readonly log: (...a: unknown[]) => void;
   private readonly dataDir: string;
   private readonly callApi: (action: string, params: Record<string, unknown>) => Promise<{ data?: unknown; error?: string }>;
+  private readonly resolveLibraryImage: QZonePosterOptions['resolveLibraryImage'];
   private readonly getContext: () => string;
   private readonly getRecentImageUrl: () => string | null;
   private readonly isPaused: () => boolean;
@@ -131,6 +133,7 @@ export class QZonePoster {
 
   constructor(opts: QZonePosterOptions) {
     this.cfg = opts.cfg;
+    this.resolveLibraryImage = opts.resolveLibraryImage;
     this.log = opts.log;
     this.dataDir = opts.dataDir;
     this.callApi = opts.callApi;
@@ -166,17 +169,21 @@ export class QZonePoster {
   }
 
   /** 发动态：content 须由调用方（主模型经 qq_qzone（action=post））显式提供。NapCat/SnowLuma 用扁平 action 名 send_qzone_msg + ugc_right。 */
-  async post(opts: { content: string; images?: string[]; topic?: string; permission?: number | string }): Promise<QZonePostResult> {
+  async post(opts: { content: string; images?: unknown; topic?: string; permission?: number | string }): Promise<QZonePostResult> {
     if (!this.cfg.enabled) return { ok: false, error: 'QQ 空间未启用（先在控制台开 worlds.qqbot.qzone.enabled）。' };
     const content = (opts.content || '').trim();
     if (!content) return { ok: false, error: '动态内容不能为空：请用 content 给出要发的内容（本扩展不再自动生成动态文本）。' };
     if (this.cfg.dailyQuota > 0 && this.state.dailyCount >= this.cfg.dailyQuota) {
       return { ok: false, error: `今天自动发动态已达上限（${this.cfg.dailyQuota}），请明天再发，或手动发。` };
     }
+    let images: string[];
+    try {
+      images = this.prepareImages(opts.images === undefined ? this.collectImages() : opts.images);
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : '无法读取附图' };
+    }
     const params: Record<string, unknown> = {
-      content,
-      // 模型提供的附图经白名单过滤；bot 自己收到的本地图片（collectImages）是可信内部来源，不经此过滤。
-      images: this.sanitizeImages(opts.images) ?? (this.cfg.imageMode !== 'none' ? this.collectImages() : []),
+      content, images,
       // NapCat/SnowLuma 的 send_qzone_msg 用 ugc_right（仅 1/4/16/64/128 合法）；旧的 'qzone.publish' + visible.type(2/8 非法) 会被拒。
       ugc_right: this.resolveUgcRight(opts.permission, this.cfg.permission),
     };
@@ -336,19 +343,56 @@ export class QZonePoster {
     return url ? [url] : [];
   }
 
-  /**
-   * 校验模型经 qq_qzone(action=post) 提供的附图链接：仅收 http(s):// 与 data: 图片（base64://）；
-   * 拒绝 file:// 等本地/任意协议，避免模型借附图把本机任意文件上传出去（纵深防御：
-   * world 层已过滤一次，这里作为真正调 API 的边界再挡一道）。
-   */
-  private sanitizeImages(urls: string[] | undefined): string[] | undefined {
-    if (!urls || !urls.length) return undefined;
-    // 仅收 http(s):// 与 base64:// / data: 图片数据；拒绝 file:// 等本地/任意协议，避免模型借附图把本机任意文件上传出去。
-    return urls.filter(
-      (u) =>
-        typeof u === 'string' &&
-        (isPublicImageUrl(u) || /^base64:\/\//.test(u) || /^data:image\//i.test(u)),
-    );
+  /** 显式 [] 表示纯文字；每张图都须有效，才允许调用发布 API。 */
+  private prepareImages(input: unknown): string[] {
+    if (!Array.isArray(input)) throw new Error('images 必须是数组。');
+    let remaining = 8 * 1024 * 1024;
+    return input.map((value, i) => {
+      const fail = (why: string): never => { throw new Error(`第 ${i + 1} 张附图：${why}；本条未发布。`); };
+      if (typeof value !== 'string') return fail('需提供图片链接或资料库标记');
+      if (isPublicImageUrl(value)) return value;
+      const prefix = /^(?:base64:\/\/|data:image\/[a-z0-9.+-]+;base64,)/i.exec(value);
+      if (prefix) {
+        const data = value.slice(prefix[0].length);
+        if (data.length > Math.ceil(remaining / 3) * 4) return fail('内联图片合计超过 8 MiB');
+        if (!data || !/^[A-Za-z0-9+/]+={0,2}$/.test(data) || data.replace(/=+$/, '').length % 4 === 1 ||
+            (data.endsWith('=') && data.length % 4 !== 0)) return fail('base64 数据无效');
+        remaining -= Buffer.from(data, 'base64').length;
+        if (remaining < 0) return fail('内联图片合计超过 8 MiB');
+        return value;
+      }
+      const marker = /^\[(图片|表情包):([^\[\]\r\n]{1,200})\]$/.exec(value);
+      if (!marker) return fail('仅支持公开图片链接、base64、[图片:文件名] 或 [表情包:文件名]');
+      const file = this.resolveLibraryImage?.(marker[1], marker[2].trim());
+      if (!file) return fail('资料库中找不到指定的普通文件或路径不安全');
+      // 只读取校验过的库内文件；按实际文件大小限制内存，再确认图片文件头。
+      let fd: number | undefined;
+      let bytes: Buffer;
+      try {
+        fd = fs.openSync(file, 'r');
+        const st = fs.fstatSync(fd);
+        if (!st.isFile()) return fail('不是普通文件');
+        if (st.size > remaining) return fail('内联图片合计超过 8 MiB');
+        bytes = Buffer.alloc(st.size);
+        let n = 0;
+        while (n < bytes.length) {
+          const got = fs.readSync(fd, bytes, n, bytes.length - n, null);
+          if (!got) return fail('文件读取不完整');
+          n += got;
+        }
+      } catch (e) {
+        if (e instanceof Error && e.message.endsWith('本条未发布。')) throw e;
+        return fail('文件不可读取');
+      } finally { if (fd !== undefined) fs.closeSync(fd); }
+      const head = bytes.subarray(0, 12);
+      if (!(head.subarray(0, 8).equals(Buffer.from('89504e470d0a1a0a','hex')) ||
+            head.subarray(0, 3).equals(Buffer.from([255,216,255])) ||
+            /^GIF8[79]a/.test(head.toString('latin1')) ||
+            (head.toString('ascii',0,4) === 'RIFF' && head.toString('ascii',8,12) === 'WEBP')))
+        return fail('本地附图仅支持 PNG、JPEG、GIF、WebP');
+      remaining -= bytes.length;
+      return 'base64://' + bytes.toString('base64');
+    });
   }
 
   /** 评论事件：沉淀为外部事件 + 若开启自动回复则请主模型回复。 */

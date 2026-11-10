@@ -1,3 +1,4 @@
+import { IndexedMediaFiles } from './indexed-media.ts';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { extname, join } from 'node:path';
@@ -48,6 +49,10 @@ export interface ImageStoreResult {
  * - 图片目录独立于 emojiDir，发送解析也会重新校验目录和符号链接。
  */
 export class ImageStore {
+  private readonly indexedFiles: IndexedMediaFiles;
+  reconcile(legacy: string[]): Promise<void> {
+    return this.indexedFiles.reconcile(this.meta.values(), legacy, this.log);
+  }
   private readonly dir: string;
   private readonly vision: StickerVisionCfg;
   private readonly log: Logger;
@@ -76,6 +81,7 @@ export class ImageStore {
     }, model: string) => void,
   ) {
     this.dir = dir;
+    this.indexedFiles = new IndexedMediaFiles('image', dir);
     this.vision = vision;
     this.log = log.child('image-store');
     this.indexFile = dataDir ? join(dataDir, 'image-index.json') : '';
@@ -95,7 +101,7 @@ export class ImageStore {
   }
 
   get size(): number {
-    return this.meta.size;
+    return this.indexedFiles.availableCount(this.meta.size);
   }
 
   flush(): void {
@@ -103,7 +109,7 @@ export class ImageStore {
   }
 
   recent(limit = 10): ImageMeta[] {
-    return [...this.meta.values()]
+    return [...this.meta.values()].filter(m => this.indexedFiles.available(m))
       .sort((a, b) => b.lastSaved - a.lastSaved)
       .slice(0, Math.max(1, Math.min(50, Math.floor(limit))));
   }
@@ -114,6 +120,7 @@ export class ImageStore {
     const hash = createHash('sha256').update(bytes).digest('hex');
     const existing = this.meta.get(hash);
     if (existing) {
+      if (!this.indexedFiles.repair(existing, bytes)) return { ok: false, error: '图片文件不可恢复。' };
       existing.count++;
       existing.lastSaved = Date.now();
       this.applyPatch(existing, patch);
@@ -161,6 +168,7 @@ export class ImageStore {
   delete(file: string): boolean {
     const m = this.find(file);
     if (!m) return false;
+    this.indexedFiles.forget(m.hash);
     this.meta.delete(m.hash);
     try {
       unlinkSync(join(this.dir, m.file));

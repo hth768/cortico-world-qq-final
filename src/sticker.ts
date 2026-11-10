@@ -1,3 +1,4 @@
+import { IndexedMediaFiles } from './indexed-media.ts';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, unlinkSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, extname } from 'node:path';
@@ -57,6 +58,10 @@ interface Job {
  * - 元数据持久化到 <dataDir>/sticker-index.json，跨重启仍生效。
  */
 export class StickerStore {
+  private readonly indexedFiles: IndexedMediaFiles;
+  reconcile(legacy: string[]): Promise<void> {
+    return this.indexedFiles.reconcile(this.meta.values(), legacy, this.log);
+  }
   private readonly dir: string;
   private readonly vision: StickerVisionCfg;
   private readonly log: Logger;
@@ -93,6 +98,7 @@ export class StickerStore {
     addToFavorites?: (bytes: Uint8Array, ext: string) => Promise<string | null>,
   ) {
     this.dir = dir;
+    this.indexedFiles = new IndexedMediaFiles('sticker', dir);
     this.vision = vision;
     this.log = log.child('sticker');
     this.secret = secret;
@@ -109,7 +115,7 @@ export class StickerStore {
   }
 
   get size(): number {
-    return this.meta.size;
+    return this.indexedFiles.availableCount(this.meta.size);
   }
 
   /** 消息里检测到表情包时调用（异步、不阻塞事件循环）。 */
@@ -134,13 +140,14 @@ export class StickerStore {
     const byEmotion: Record<string, number> = {};
     let synced = 0;
     for (const m of this.meta.values()) {
+      if (!this.indexedFiles.available(m)) continue;
       byEmotion[m.emotion] = (byEmotion[m.emotion] ?? 0) + 1;
       if (m.emojiId) synced++;
     }
-    const recent = [...this.meta.values()]
+    const recent = [...this.meta.values()].filter(m => this.indexedFiles.available(m))
       .sort((a, b) => b.lastSeen - a.lastSeen)
       .slice(0, limit);
-    return { total: this.meta.size, byEmotion, synced, recent };
+    return { total: this.size, byEmotion, synced, recent };
   }
 
   /**
@@ -157,7 +164,7 @@ export class StickerStore {
     let n = 0;
     for (const m of this.meta.values()) {
       if (n >= max) break;
-      if (m.emojiId) continue; // 已同步过
+      if (m.emojiId || !this.indexedFiles.available(m)) continue; // 已同步过
       r.checked++;
       n++;
       try {
@@ -226,6 +233,7 @@ export class StickerStore {
     } catch (e) {
       if ((e as NodeJS.ErrnoException).code !== 'ENOENT') return false;
     }
+    this.indexedFiles.forget(m.hash);
     this.meta.delete(m.hash);
     this.flush();
     return true;
@@ -252,6 +260,7 @@ export class StickerStore {
       const ann = !this.meta.has(hash) && this.vision.enabled ? await this.annotate(bytes) : { emotion: '未知', usage: '未知', tag: '' };
       const existing = this.meta.get(hash);
       if (existing) {
+        if (!this.indexedFiles.repair(existing, bytes)) return null;
         existing.count++;
         existing.lastSeen = Date.now();
         if (job.summary && !existing.summary) existing.summary = job.summary;

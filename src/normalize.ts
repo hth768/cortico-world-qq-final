@@ -65,6 +65,14 @@ function resolveEmojiFile(emojiDir: string, fname: string): string | null {
 // 仅供测试断言路径收敛用（命名空间导出不进入运行时契约）。
 export const __resolveEmojiFileForTest = resolveEmojiFile;
 
+export function resolveLibraryImage(name: string, dirs: string[]): string | null {
+  for (const dir of new Set(dirs.filter(Boolean))) {
+    const file = resolveEmojiFile(dir, name);
+    if (file) return file;
+  }
+  return null;
+}
+
 /** 图片库使用同一套目录边界检查，但目录与 emojiDir 永远分开。 */
 function resolveImageFile(imageDir: string, fname: string): string | null {
   return resolveEmojiFile(imageDir, fname);
@@ -174,7 +182,7 @@ export function renderSegmentsPlain(segments: OneBotSegment[] | string | undefin
  *   - 其它 [..] → 普通文本（保留方括号原样）
  * emojiDir/imageDir 为空时不解析对应标记。
  */
-export function buildOutgoing(text: string, emojiDir = '', imageDir = '', imageTransport: 'path' | 'base64' = 'path', stickerDir = emojiDir, onMissing?: (kind: string) => void): OneBotSegment[] {
+export function buildOutgoing(text: string, emojiDir = '', imageDir = '', imageTransport: 'path' | 'base64' = 'path', stickerDir = emojiDir, onMissing?: (kind: string, name: string, dirs: string[], reason: string) => void): OneBotSegment[] {
   const imageSegment = (file: string): OneBotSegment | null => {
     if (imageTransport === 'base64') {
       try {
@@ -190,6 +198,11 @@ export function buildOutgoing(text: string, emojiDir = '', imageDir = '', imageT
   let last = 0;
   let m: RegExpExecArray | null;
   while ((m = re.exec(text)) !== null) {
+    if (m.index > last && text[m.index - 1] === '\\' && /^(表情包|图片):/.test(m[1] ?? '')) {
+      segments.push({ type: 'text', data: { text: text.slice(last, m.index - 1) + m[0] } });
+      last = re.lastIndex;
+      continue;
+    }
     if (m.index > last) segments.push({ type: 'text', data: { text: text.slice(last, m.index) } });
     if (m[1] !== undefined) {
       const inner = m[1];
@@ -198,13 +211,10 @@ export function buildOutgoing(text: string, emojiDir = '', imageDir = '', imageT
         const sticker = inner.startsWith('表情包:');
         const fname = inner.slice(inner.indexOf(':') + 1).trim();
         const dirs = sticker ? [stickerDir, emojiDir] : [imageDir];
-        let segment: OneBotSegment | null = null;
-        for (const dir of new Set(dirs.filter(Boolean))) {
-          const file = resolveEmojiFile(dir, fname);
-          if (file) { segment = imageSegment(file); break; }
-        }
+        const file = resolveLibraryImage(fname, dirs);
+        const segment = file ? imageSegment(file) : null;
         if (segment) segments.push(segment);
-        else onMissing?.(sticker ? '表情包' : '图片');
+        else onMissing?.(sticker ? '表情包' : '图片', fname.replace(/[\r\n\x00-\x1f]/g, ' '), dirs, file ? '文件不可读取' : '文件不存在或不是安全的库内文件');
       } else if (/^表情\s*\d+(?:[:：][^\]]*)?$/.test(inner)) {
         const id = inner.match(/^表情\s*(\d+)/)![1];
         segments.push({ type: 'face', data: { id: Number(id) } });

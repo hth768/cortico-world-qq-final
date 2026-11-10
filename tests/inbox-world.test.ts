@@ -13,12 +13,12 @@ const releaseMain = releaseRoot ? JSON.parse(readFileSync(join(releaseRoot, 'pac
 const releaseDefinition = releaseRoot
   ? (await import(pathToFileURL(join(releaseRoot, releaseMain)).href)).definition : null;
 
-function fixture(t: TestContext, mode = 'active', patch = {}) {
+function fixture(t: TestContext, mode = 'active', patch = {}, packageDir = '') {
   const dir = mkdtempSync(join(tmpdir(), 'qq-inbox-world-'));
   const config = { ...structuredClone(QQ_DEFAULTS), receiveMode: mode, groups: [12345], privates: [23456], ...patch };
   const world: any = releaseDefinition
-    ? releaseDefinition.create({ cfg: config, packageDir: '', dataDir: dir, secret: () => '' })
-    : new QQWorld(config as any, '', dir);
+    ? releaseDefinition.create({ cfg: config, packageDir, dataDir: dir, secret: () => '' })
+    : new QQWorld(config as any, packageDir, dir);
   const events: any[] = [];
   const log: any = { info() {}, warn() {}, error() {}, debug() {}, child: () => log };
   let fail = false;
@@ -322,4 +322,80 @@ test('跨天查收与聚合私聊：正文显示每条原消息的 ISO 时间及
   await new Promise(r=>setTimeout(r,150));
   assert.equal(p.events.length, 1);
   assert.match(p.events[0].text,/2026-11-06T23:59:59\.000\+08:00[\s\S]+2026-11-07T00:00:00\.000\+08:00/);
+});
+
+test('空间显式附图全部有效才发布：不静默丢图，也不替换为最近图片', async (t) => {
+  const { mkdirSync, writeFileSync } = await import('node:fs');
+  const f = fixture(t, 'active', { qzone: { ...QQ_DEFAULTS.qzone, enabled: true, imageMode: 'recent' } });
+  const dir = join(f.world.dataDir, 'owned');
+  f.world.imageDirAbs = dir;
+  f.world.stickerDirAbs = dir;
+  mkdirSync(dir);
+  const bytes = Buffer.from('GIF89a');
+  writeFileSync(join(dir,'cat.gif'), bytes);
+  writeFileSync(join(dir,'fake.gif'), 'not image');
+  writeFileSync(join(dir,'large.gif'), Buffer.alloc(8*1024*1024+1));
+  const calls: string[][] = [];
+  f.world.driver.callApi = async (action: string, params: any) => { assert.equal(action, 'send_qzone_msg'); calls.push(params.images); return null; };
+  f.world.recentImages.push({url:'https://example.org/recent.png'});
+  f.world.initQzone();
+  const tool = f.world.tools().find((v: any) => v.name === 'qq_qzone');
+  const post = (images?: unknown) => tool.handler({action:'post',content:'配图测试',images}, {});
+  for (const bad of [null, 'cat.gif', [123], [join(dir,'cat.gif')], ['[图片:../cat.gif]'], ['[图片:missing]'], ['[图片:fake.gif]'], ['[图片:large.gif]'], ['https://example.org/ok','file:///bad'], ['base64://!!!']]) {
+    assert.match(await post(bad), /失败/);
+    assert.equal(calls.length,0);
+  }
+  const inline = 'base64://'+bytes.toString('base64'), data = 'data:image/gif;base64,'+bytes.toString('base64');
+  await post(['[图片:cat.gif]', '[表情包:cat.gif]', inline, data]);
+  await post([]);
+  await post();
+  assert.deepEqual(calls, [[inline,inline,inline,data],[],['https://example.org/recent.png']]);
+});
+
+test('升级：新目录优先，只恢复本部署索引匹配的旧文件，缺图可重新收藏', async (t) => {
+  const { createHash } = await import('node:crypto');
+  const { mkdirSync, writeFileSync, existsSync } = await import('node:fs');
+  const pkg = mkdtempSync(join(tmpdir(), 'qq-old-package-'));
+  t.after(() => rmSync(pkg, {recursive:true,force:true}));
+  const absoluteVideos = join(pkg,'custom-videos');
+  const f = fixture(t,'active',{vision:{...QQ_DEFAULTS.vision, videoDir:absoluteVideos}, asr:{...QQ_DEFAULTS.asr,mode:'off'}, sendIntervalMs:0},pkg);
+  const w = f.world, dir = w.dataDir;
+  const current = Buffer.from('GIF89a-current'), previous = Buffer.from('GIF89a-legacy'), lost = Buffer.from('GIF89a-missing');
+  const meta = (kind: string, bytes: Buffer) => {
+    const hash=createHash('sha256').update(bytes).digest('hex');
+    return {hash,file:`${kind}-${hash.slice(0,16)}.gif`,ext:'.gif',size:bytes.length,label:'保留标注',count:1,sources:[],emotion:'开心',lastSeen:1};
+  };
+  for (const [kind,folder] of [['sticker','emoji'],['image','images'],['file','files']]) {
+    for (const base of [dir,pkg]) mkdirSync(join(base,folder),{recursive:true});
+    const [a,b,c]=[current,previous,lost].map(bytes=>meta(kind,bytes));
+    writeFileSync(join(dir,folder,a.file),current);
+    writeFileSync(join(pkg,folder,a.file),'wrong');
+    writeFileSync(join(pkg,folder,b.file),previous);
+    writeFileSync(join(pkg,folder,c.file),'wrong hash');
+    writeFileSync(join(pkg,folder,'unindexed.gif'),previous);
+    writeFileSync(join(dir,kind+'-index.json'),JSON.stringify(kind==='file'?[a,b,c]:Object.fromEntries([a,b,c].map(m=>[m.hash,m]))));
+  }
+  w.createDriver=()=>({start:async()=>{},stop:async()=>{},callApi:async()=>({message_id:123})});
+  await w.start(w.host);
+  assert.equal(w.videoDirAbs,absoluteVideos);
+  for(const [kind,folder,store] of [['sticker','emoji',w.stickers],['image','images',w.images],['file','files',w.files]]){
+    assert.equal(store.size,2);
+    assert.deepEqual(readFileSync(join(dir,folder,meta(kind,current).file)),current);
+    assert.deepEqual(readFileSync(join(dir,folder,meta(kind,previous).file)),previous);
+    assert.ok(existsSync(join(pkg,folder,meta(kind,previous).file)));
+    assert.ok(!existsSync(join(dir,folder,meta(kind,lost).file)));
+    assert.ok(!existsSync(join(dir,folder,'unindexed.gif')));
+  }
+  assert.ok(w.files.resolve(meta('file',previous).file));
+  const m=meta('sticker',lost);
+  const result=await w.sendTo('private:23456',`[表情包:${m.file}]`);
+  assert.match(result,/未发送/); assert.ok(result.includes(m.file));
+  w.stickers.fetchBytes=async()=>lost;
+  assert.equal((await w.stickers.saveOne('https://example.org/lost.gif','private:23456',{})).label,'保留标注');
+  assert.equal(w.stickers.stats().total,3);
+  assert.match(await w.sendTo('private:23456',`[表情包:${m.file}]`),/发送 1\/1/);
+  const sent: any[] = [];
+  w.driver.callApi=async (_: string,args: any)=>{sent.push(...args.message);return {message_id:111};};
+  await w.sendTo('private:23456','字面示例：\\[图片:missing.gif]');
+  assert.equal(sent[0].data.text,'字面示例：[图片:missing.gif]');
 });

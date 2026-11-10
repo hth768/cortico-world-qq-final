@@ -9,7 +9,7 @@ import { QQ_CONFIG_GROUP, QQ_VOICE_GROUP, QQ_ASR_GROUP, QQ_DEFAULTS, normalizeCo
 import { transcribeRecord, transcribeAudioBytes, synthesizeVoice, checkVoiceDeps, voiceReady, splitIntoSentences, type RuntimeVoiceCfg } from './voice.ts';
 import { isAbsolute, join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { buildOutgoing, eventClock, eventTs, renderIncoming, renderSegmentsPlain, splitReplyIntoMessages } from './normalize.ts';
+import { resolveLibraryImage, buildOutgoing, eventClock, eventTs, renderIncoming, renderSegmentsPlain, splitReplyIntoMessages } from './normalize.ts';
 import { forwardSource as inferForwardSource } from './forward-source.ts';
 import { externalDataBlock } from './external-data.ts';
 import { QQInbox, shouldQueue } from './inbox.ts';
@@ -122,7 +122,7 @@ function buildFfmpegCandidates(configPath: string, packageDir: string): string[]
   return out;
 }
 
-/** 将相对目录统一解析到扩展目录；空配置使用调用方提供的回退目录。 */
+/** 将相对目录解析到指定根目录；空配置使用调用方提供的回退目录。 */
 function resolveConfiguredDir(value: string, packageDir: string, fallback = ''): string {
   if (!value) return fallback;
   return isAbsolute(value) ? value : join(packageDir, value);
@@ -223,11 +223,12 @@ export class QQWorld implements World {
     this.stateFile = dataDir ? join(dataDir, 'qqbot-known-messages.json') : '';
     this.inbox = new QQInbox(dataDir ? join(dataDir, 'qqbot-inbox.json') : '',
       () => this.log.warn('QQ 未读箱读写失败，请检查实例数据目录的空间与权限。'));
-    this.emojiDirAbs = resolveConfiguredDir(this.config.emojiDir, this.packageDir);
-    this.stickerDirAbs = resolveConfiguredDir(this.config.sticker.dir, this.packageDir, this.emojiDirAbs);
-    this.imageDirAbs = resolveConfiguredDir(this.config.imageDir, this.packageDir, join(this.packageDir, 'images'));
-    this.fileDirAbs = resolveConfiguredDir(this.config.fileDir, this.packageDir, join(this.packageDir, 'files'));
-    this.videoDirAbs = resolveConfiguredDir(this.config.vision.videoDir, this.packageDir, join(this.packageDir, 'videos'));
+    const mediaRoot = this.dataDir || this.packageDir;
+    this.emojiDirAbs = resolveConfiguredDir(this.config.emojiDir, mediaRoot);
+    this.stickerDirAbs = resolveConfiguredDir(this.config.sticker.dir, mediaRoot, this.emojiDirAbs);
+    this.imageDirAbs = resolveConfiguredDir(this.config.imageDir, mediaRoot, join(mediaRoot, 'images'));
+    this.fileDirAbs = resolveConfiguredDir(this.config.fileDir, mediaRoot, join(mediaRoot, 'files'));
+    this.videoDirAbs = resolveConfiguredDir(this.config.vision.videoDir, mediaRoot, join(mediaRoot, 'videos'));
     this.vision = new Vision(this.config.vision, consoleLogger());
   }
 
@@ -365,7 +366,7 @@ export class QQWorld implements World {
       this.host?.reportUsage(usage, { model, label: '辅助视觉' });
     });
     this.stickers = new StickerStore(
-      this.stickerDirAbs || this.emojiDirAbs || join(this.packageDir, 'emoji'),
+      this.stickerDirAbs || this.emojiDirAbs || join(this.dataDir || this.packageDir, 'emoji'),
       this.config.vision,
       this.log,
       this.dataDir,
@@ -382,6 +383,10 @@ export class QQWorld implements World {
       (usage, model) => this.host?.reportUsage(usage, { model, label: '图片库标注' }),
     );
     this.files = new FileStore(this.fileDirAbs, this.log, this.dataDir);
+    const legacy = (value: string) => this.packageDir && value && !isAbsolute(value) ? [join(this.packageDir, value)] : [];
+    await this.stickers.reconcile(legacy(this.config.sticker.dir || this.config.emojiDir));
+    await this.images.reconcile(legacy(this.config.imageDir));
+    await this.files.reconcile(legacy(this.config.fileDir));
     this.videos = new VideoStore(
       this.videoDirAbs,
       buildFfmpegCandidates(this.config.asr.ffmpegPath, this.packageDir),
@@ -436,6 +441,7 @@ export class QQWorld implements World {
       callApi: (action, params) => this.driver.callApi(action, params),
       getContext: () => this.qzoneContext(),
       getRecentImageUrl: () => this.recentImageUrl(),
+      resolveLibraryImage: (kind, name) => resolveLibraryImage(name, kind === '图片' ? [this.imageDirAbs] : [this.stickerDirAbs, this.emojiDirAbs]),
       isPaused: () => this.config.receiveMode === 'active' || (this.host?.isPaused?.() ?? false),
       pushEvent: (e: QZoneEventEnvelope) => {
         if (e.type === 'qq.qzone.comment' && this.config.receiveMode !== 'passive') {
@@ -2230,9 +2236,12 @@ export class QQWorld implements World {
     }
 
     const missing: string[] = [];
-    const outgoing = buildOutgoing(text, this.emojiDirAbs, this.imageDirAbs, this.outgoingImageTransport(), this.stickerDirAbs, (kind) => missing.push(kind));
+    const outgoing = buildOutgoing(text, this.emojiDirAbs, this.imageDirAbs, this.outgoingImageTransport(), this.stickerDirAbs, (kind, name, dirs, reason) => {
+      missing.push(`${kind}「${name}」：${reason}`);
+      this.log.warn('本地附件未发送', { kind, name, dirs, reason });
+    });
     if (missing.length) {
-      const reason = `本条未发送：${missing.length} 个${[...new Set(missing)].join('/')}标记无法解析或读取，请核对资料库文件名与目录。`;
+      const reason = `本条未发送：${missing.length} 个标记无法解析或读取。${missing.slice(0, 3).join('；')}。`;
       this.log.warn(reason, { address });
       return QQWorld.SEND_FAILED + reason;
     }
@@ -3057,7 +3066,7 @@ export class QQWorld implements World {
           action: { type: 'string', enum: ['post', 'delete', 'reply', 'detail', 'feeds', 'status'], description: '子功能：post 发动态 / delete 删动态 / reply 回评论 / detail 查动态详情与评论 / feeds 列动态 / status 看状态。' },
           content: { type: 'string', description: '【post】动态正文（必填）：以第一人称写，结合最近聊天与记忆发表真实看法/吐槽/简介/心情。' },
           topic: { type: 'string', description: '可选方向提示，如"吐槽最近的天气""介绍一下小明"。' },
-          images: { type: 'array', items: { type: 'string' }, description: '【post】附图链接数组（仅支持 http(s):// 与 base64://；不支持本机文件）。' },
+          images: { type: 'array', items: { type: 'string' }, description: '【post】附图数组：公开 HTTP(S)、base64://、data:image/...;base64 或 [图片:文件名] / [表情包:文件名]。内联合计最多 8 MiB，不接受任意路径；[] 表示不配图。' },
           permission: { type: 'number', description: '【post】可见权限 ugc_right，默认 1=公开。' },
           tid: { type: 'string', description: '【delete/reply/detail】动态 tid（来自 feeds 返回、post 返回或 status 最近列表）。' },
           uin: { type: 'number', description: '【detail】动态作者（贴主）的 QQ 号，来自 feeds 返回的 uin；查好友动态详情时必填，自家动态可省略。' },
@@ -3074,12 +3083,7 @@ export class QQWorld implements World {
             const r = await this.qzone.post({
               content: typeof args.content === 'string' ? args.content : undefined,
               topic: typeof args.topic === 'string' ? args.topic : undefined,
-              // 附图安全白名单：只允许 http(s) URL 与 base64 图片数据；拒绝 file:// 等本地/任意协议（0.6.0 重写时丢掉的过滤）。
-              images: Array.isArray(args.images)
-                ? args.images
-                    .filter((x): x is string => typeof x === 'string')
-                    .filter((x) => /^https?:\/\//i.test(x) || /^data:image\/[a-z0-9.+-]+;base64,/i.test(x))
-                : undefined,
+              images: args.images,
               permission: typeof args.permission === 'number' ? args.permission : undefined,
             });
             return r.ok

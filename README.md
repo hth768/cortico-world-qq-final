@@ -81,13 +81,13 @@ Cortico 的 **QQ（OneBot v11 / NapCat）** World 扩展。以 `fat-fish` 仓库
 | `privateAggregationWindow` | `0` | 私聊连续消息聚合窗口(ms)，0=不聚合 |
 | `maxMessageBytes` | `1500` | 长文本强制分片字节数 |
 | `deliverImageAttachments` | `true` | 图片作为模型附件（需模型支持图像）。这是默认的看图路径 |
-| `imageDir` | `images` | 独立图片库目录（相对扩展或绝对路径），与 `emojiDir` 分开；保存的图片用 `[图片:文件名]` 发送 |
-| `fileDir` | `files` | 普通文件资料库目录（相对扩展或绝对路径），与 `emojiDir` / `imageDir` 分开；收到的文件按内容哈希保存 |
+| `imageDir` | `images` | 独立图片库目录（相对部署数据目录或绝对路径），与 `emojiDir` 分开；保存的图片用 `[图片:文件名]` 发送 |
+| `fileDir` | `files` | 普通文件资料库目录（相对部署数据目录或绝对路径），与 `emojiDir` / `imageDir` 分开；收到的文件按内容哈希保存 |
 | `imageTransport` | `auto` | 图片/表情包发送方式：`auto` 按协议端地址判断，远程 NapCat/SnowLuma 自动用 `base64://`；也可强制 `path` 或 `base64` |
 | `vision.enabled` | `false` | 辅助视觉：用另一个 VLM 描述图片。主模型本身能看图时不必开（两条路会重复花钱） |
 | `vision.endpoint` / `vision.apiKeySecret` / `vision.model` | `""` | 开启辅助视觉后**三项必填**。密钥只写名字（如 `DEEPSEEK_API_KEY`），值放在部署密钥库（.env）里，由框架 `secret()` 读取 |
 | `vision.videoEnabled` | `false` | 视频理解开关；开启后把收到的视频保存到独立 `videoDir`，用 ASR 配置里的 ffmpeg 抽帧拼图 |
-| `vision.videoDir` | `videos` | 视频文件目录（相对扩展或绝对路径）；文件名由内容哈希生成，不保存来源 URL |
+| `vision.videoDir` | `videos` | 视频文件目录（相对部署数据目录或绝对路径）；文件名由内容哈希生成，不保存来源 URL |
 | `vision.videoFrameIntervalSec` | `1` | 视频抽帧间隔，单位秒，默认一秒一帧；先裁剪到当前时间窗再抽帧，避免画面与声音错位 |
 | `vision.videoMaxFrames` | `12` | 每个时间窗最多抽帧数，抽帧后拼成一张 PNG 附件 |
 | `vision.videoSegmentSec` | `8` | 视频时间窗长度；每个时间窗单独拼图并配声音转写 |
@@ -290,7 +290,7 @@ interface VoiceProvider {
 - `qq_reminder（action=add）`：添加一条到点提醒（`content` 内容、`when` 如 `20:30` 或 ` tomorrow 8:00` 或 ISO 时间、可填 `who` 给指定人）。到点自动发到对应会话，带优雅超时控制。
 - `qq_reminder（action=list）`：列出当前待触发的提醒。
 - `qq_reminder（action=cancel）`：取消一条提醒（`id` 或 `all=true` 取消全部）。
-- `qq_qzone（action=post）`：发表 QQ 空间动态（说说）。参数 `content`（正文，必填，由模型自行生成后传入）、`topic`（话题）、`images`（图片数组，仅限 http(s)/base64）、`permission`（可见权限 `ugc_right`，默认 1=公开）。后台自动冒泡由 `qzone.tickSec`/`chancePerTick` 触发主模型生成并发布，工具本身不自动生成文案。
+- `qq_qzone（action=post）`：发表 QQ 空间动态（说说）。参数 `content`（正文，必填，由模型自行生成后传入）、`topic`（话题）、`images`（附图数组，支持公开 HTTP(S)、base64://、图片 data URI 和库内标记，例如 `images: ["[图片:封面.png]", "[表情包:微笑.gif]"]`；本地图支持 PNG/JPEG/GIF/WebP，内联数据合计上限 8 MiB。任一张无效则不发布，显式空数组表示纯文字）、`permission`（可见权限 `ugc_right`，默认 1=公开）。后台自动冒泡由 `qzone.tickSec`/`chancePerTick` 触发主模型生成并发布，工具本身不自动生成文案。
 - `qq_qzone（action=delete）`：删除指定 `tid` 的动态。
 - `qq_qzone（action=reply）`：对某条动态发表评论（`tid` + `content`，`comment_id` 可留空；NapCat/SnowLuma 仅支持对整个动态评论，不支持按评论楼中楼回复。要回复某条评论时，在 `content` 里 @对方昵称 发在该动态下即可）。
 - `qq_qzone（action=detail）`：查看一条动态的详情与全部评论（`tid` + `uin`=动态作者 QQ 号，均来自 `feeds` 返回；自家动态 `uin` 可省略）。评论已规整为 `{commentId, uin, name, time, content, replies[]}`，内联 @ 标记转为可读的 `@昵称(uin:xxx)`；模型拿到评论者 uin 后用 `action=reply` + content 里 @对方 即可回复。依赖 SnowLuma `get_qzone_msg_detail`（NapCat 不一定提供，失败会返回 error）。
@@ -345,11 +345,15 @@ interface VoiceProvider {
 - `qq_proactive（action=status）`：查看调度器状态——运行态（暖场/稳定/静默）、今日已发/配额、各会话的未回复与静默情况、最近主动说过的话。
 - `qq_proactive（action=trigger）`：手动触发一次主动说话（随机挑一个可主动的监听会话，或用 `address` 指定如 `private:123`），便于测试。
 
+## 媒体目录与旧收藏
+
+相对的 emoji、images、files、videos 和自定义收藏目录均以本部署的数据目录（dataDir）为基准；绝对路径不变。升级后首次启动会逐条核对本部署的表情包、图片和文件索引：新目录缺文件时，仅从对应旧包目录复制文件名和完整 SHA-256 都匹配的文件，不覆盖新文件、不删除旧文件。两边都找不到的条目保留标注并在日志中告警，不计入可用列表；再次保存相同内容可恢复。没有索引的手工图片和旧视频不会从可能共享的包目录批量导入，请按需复制到新目录。目录配置在实例重启后生效。
+
 ## 表情包与视觉
 
-- `qq_image`：独立图片资料库。`save` 只能从最近收到的 QQ 图片中选择一张保存；`list` 查看真实文件名和标注；`tag` 修改名称/主题标签/使用场景；`delete` 删除图片。图片库使用独立的 `imageDir`（默认 `<扩展>/images`），不会写入表情包的 `emojiDir`。保存时可选用视觉模型自动生成短标签，所有标签都会清洗为单行资料文本，不会推送成内部事件。
+- `qq_image`：独立图片资料库。`save` 只能从最近收到的 QQ 图片中选择一张保存；`list` 查看真实文件名和标注；`tag` 修改名称/主题标签/使用场景；`delete` 删除图片。图片库使用独立的 `imageDir`（默认 `<dataDir>/images`），不会写入表情包的 `emojiDir`。保存时可选用视觉模型自动生成短标签，所有标签都会清洗为单行资料文本，不会推送成内部事件。
 - 图片库发送：先用 `qq_image(action=list)` 获取真实文件名，再在 `qq_send` 正文写 `[图片:文件名]`。文件名会重新经过目录边界和符号链接检查，不接受任意 URL 或目录外路径。
-- `qq_file`：普通文件资料库。收到 OneBot 文件消息或 `group_upload` / `private_file` 通知时，若协议端提供公开 HTTP(S) 下载地址，就把文件保存到独立 `fileDir`（默认 `<扩展>/files`），文件名由内容哈希生成；协议端只提供文件 ID 时会尝试调用 `get_group_file_url` / `get_private_file_url`。下载地址拒绝 `file://`、本机和常见内网地址，原始文件名只作为清洗后的资料字段保存，不进入内部事件指令。
+- `qq_file`：普通文件资料库。收到 OneBot 文件消息或 `group_upload` / `private_file` 通知时，若协议端提供公开 HTTP(S) 下载地址，就把文件保存到独立 `fileDir`（默认 `<dataDir>/files`），文件名由内容哈希生成；协议端只提供文件 ID 时会尝试调用 `get_group_file_url` / `get_private_file_url`。下载地址拒绝 `file://`、本机和常见内网地址，原始文件名只作为清洗后的资料字段保存，不进入内部事件指令。
 - 文件库操作：`qq_file(action=list)` 查看哈希文件名和标注，`tag` 修改资料标签，`delete` 删除本地文件，`send` 配合事件 `meta.conv` 把库内文件发送到监听群或私聊。发送只接受 list 返回的固定文件名，并再次检查目录和符号链接；本机协议端直接使用 `upload_group_file` / `upload_private_file`，远程 SnowLuma 会先用 `upload_file_stream` 把文件分块传到协议端再发送，协议端不支持时会返回失败原因。
 
 - `qq_sticker(action=save, conv, message_id, index=1)`：从指定会话已接收的最近 50 条媒体消息（全局缓存，重启清空）中保存一张图，可传 label/tag/usage，不必开启自动收藏。`qq_sticker(action=delete, file)` 按完整文件名同时删除本地文件和索引，不删除 QQ 收藏表情。
@@ -424,7 +428,7 @@ npm 安装包以 `dist/index.js` 为入口，不包含 `src/` 是预期行为。
 - **合并转发消息（不伪造身份）**：`qq_forward_by_id` 工具可按消息编号把本 bot 已接收/发出的多条消息合成**一张**合并转发卡片发出（卡片由本 bot 发出，node 身份只能是 bot 自己；卡片内每条消息用文本标注原始发送者昵称+QQ号并保留原文内容，不伪造任何身份）。需先开启设置 `worlds.qqbot.forwardByMessageId`（默认关闭），且仅能转发本 bot 本地记录内、属于目标会话的消息编号；依赖 OneBot 的 `send_forward_msg` 与 `get_msg`（NapCat/Lagrange/SnowLuma 等主流 OneBot v11 实现大多支持）。受 OneBot 限制，合并卡片无法把 node 身份设成原始发送者，故用「文本标注来源」保留出处。
 - 群成员名片为空时尝试补一次 `get_group_member_info`，但离线名片仍以 NapCat 推送为准。
 - 引用回复走实时 `get_msg`（与 fat-fish 一致），需要 NapCat 暴露该 API；引用库外消息也能正确拉取。
-- 表情包图片通过 `[表情包:文件名]` 发送，文件需放在 `emojiDir` 配置目录（默认 `<扩展>/emoji`）。文件名会先精确匹配；漏写或写错 `.gif`/`.png`/`.jpg`/`.jpeg`/`.webp` 扩展名时会自动尝试修正，先查收藏目录，再查表情包目录；仍找不到则整条不发送，回执和日志提示原因。
+- 表情包图片通过 `[表情包:文件名]` 发送，文件需放在 `emojiDir` 配置目录（默认 `<dataDir>/emoji`）。文件名会先精确匹配；漏写或写错 `.gif`/`.png`/`.jpg`/`.jpeg`/`.webp` 扩展名时会自动尝试修正，先查收藏目录，再查表情包目录；仍找不到则整条不发送，回执和日志提示原因。
 - 远程协议端（NapCat/SnowLuma 不在桌宠本机）发送表情包或图片时，`imageTransport=auto` 会把本地文件内联为 `base64://`，避免协议端因无法读取桌面端路径而报 `ENOENT`；同机部署可继续使用本地路径。
 - 中文表情名（如 `[旺柴]`/`[笑哭]`）按 fat-fish 的 `FACE_MAP` 映射到 face id；未知方括号文本原样保留。
 - 系统表情标记 `[表情22：白眼]` / `[表情22:白眼]`（数字为 QQ face id，支持全角/半角冒号与可选空格）会被解析成真正的 `face` 段发送。早期版本只认半角冒号，bot 照着入站的全角冒号写法输出时会变成"不存在的表情"文本，已于 0.1.8 修复。
