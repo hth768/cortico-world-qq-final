@@ -13,6 +13,7 @@ import { resolveLibraryImage, buildOutgoing, eventClock, eventTs, renderIncoming
 import { forwardSource as inferForwardSource } from './forward-source.ts';
 import { externalDataBlock } from './external-data.ts';
 import { QQInbox, shouldQueue } from './inbox.ts';
+import { GapRecovery } from './gap-recovery.ts';
 
 const ENV_PROMPT_FILE = fileURLToPath(new URL('../ENV_PROMPT.md', import.meta.url));
 // 本扩展自身包根目录（asr_sidecar.py / venv / models 真正所在）。从模块位置推算，
@@ -202,6 +203,8 @@ export class QQWorld implements World {
    */
   private msgChain: Promise<void> = Promise.resolve();
   private readonly inbox: QQInbox;
+  /** 断档补收：重连/群序号跳档时把漏掉的消息按会话补回来。 */
+  private gaps: GapRecovery | null = null;
   private stopped = false;
   private inboxReadOutput: Array<Parameters<WorldHost['pushEvent']>[0]> | null = null;
 
@@ -296,7 +299,7 @@ export class QQWorld implements World {
         this.connected = c;
         if (c) {
           if (this.config.voice.enabled) checkVoiceDeps(this.voiceRuntime(), this.log);
-          void this.reloadIdentity();
+          void this.reloadIdentity().then(() => this.recoverGaps());
         }
       },
     });
@@ -356,6 +359,17 @@ export class QQWorld implements World {
     this.log = this.host.log.child('qq');
     this.inbox.load();
     this.pruneInbox();
+    this.gaps = new GapRecovery({
+      stateFile: this.dataDir ? join(this.dataDir, 'qqbot-gap-cursor.json') : '',
+      log: this.log.child('gap'),
+      api: (action, params) => (this.driver ? this.driver.callApi(action, params) : Promise.reject(new Error('OneBot 未连接'))),
+      selfId: () => this.identity?.selfId ?? 0,
+      isSeen: (messageId) => this.processedIds.has(String(messageId)) || this.knownMessages.has(String(messageId)),
+      deliver: (address, event, stale) => this.deliverRecovered(address, event, stale),
+      groupStaleMs: () => Math.max(0, this.config.gapRecovery.groupStaleMinutes) * 60_000,
+      maxMessages: () => Math.max(1, this.config.gapRecovery.maxMessages),
+    });
+    this.gaps.load();
     // 反向监听必须在**任何连接建立之前**就备好鉴权 token：挂在 createDriver 里不够，
     // 因为面板/工具在 start 之后、driver 建立之前也可能读到 token（那时会是空）。
     this.ensureReverseToken();
@@ -406,6 +420,9 @@ export class QQWorld implements World {
       try { await this.driver.stop(); } catch (stopError) { this.log.warn('清理失败的 QQ 连接时出错', { err: String(stopError) }); }
     }
     this.loadState();
+    // 首次启用断档补收时，用 knownMessages 里各会话最新一条做锚点；连上就补一次。
+    this.gaps?.seed(this.knownMessages);
+    this.recoverGaps();
     this.initProactive();
     this.initQzone();
     // 闹钟/记事本：装载存储并启动到点检查（每 30s 扫一次；离线期间到期的也会在启动后补发）。
@@ -902,6 +919,7 @@ export class QQWorld implements World {
       this.stateSaveTimer = undefined;
     }
     this.saveState();
+    this.gaps?.save();
     this.stickerSources.clear();
     this.stickers?.flush();
     this.images?.flush();
@@ -1216,6 +1234,46 @@ export class QQWorld implements World {
     }
   }
 
+  /** 连接就绪后补收所有监听会话的断档；关闭开关时什么也不做。 */
+  private recoverGaps(): void {
+    if (!this.config.gapRecovery.enabled || !this.gaps || !this.connected) return;
+    const addresses = [...this.convs.values()]
+      .filter((conv) => this.isListened(conv.kind, conv.id))
+      .map((conv) => conv.address);
+    if (addresses.length > 0) this.gaps.recoverAll(addresses);
+  }
+
+  /**
+   * 补回来的消息：群聊超过时限的只进未读箱（不唤醒、不要求回复），
+   * 其余（含全部私聊）按实时消息处理——私聊会照常进入待回复集合。
+   */
+  private deliverRecovered(address: string, event: OneBotMessage, stale: boolean): void {
+    const separator = address.indexOf(':');
+    const kind = address.slice(0, separator);
+    const id = Number(address.slice(separator + 1));
+    if ((kind !== 'group' && kind !== 'private') || !Number.isSafeInteger(id) || id <= 0) return;
+    if (!this.isListened(kind, id)) return;
+    const messageId = Number(event.message_id);
+    if (Number.isSafeInteger(messageId) && messageId !== 0) {
+      if (this.processedIds.has(String(messageId))) return;
+      this.processedIds.add(String(messageId));
+      if (this.processedIds.size > 60000) this.processedIds.clear();
+    }
+    const conv = this.ensureConv(kind, id);
+    if (stale) {
+      this.inbox.add(conv.address, { kind: 'message', event }, Number(event.self_id) || 0);
+      // 记入已见索引：下次重启/再次补收时不会再往未读箱里堆同一条。
+      if (Number.isSafeInteger(messageId) && messageId !== 0) {
+        this.knownMessages.set(String(messageId), { conv: conv.address, ts: Date.now() });
+        this.scheduleSaveState();
+      }
+      this.log.info('群聊补档过旧，仅入未读箱', { address, message_id: event.message_id });
+      return;
+    }
+    const sender = this.resolveSender(event, kind, id);
+    this.enqueue(() => this.handleMessage(event, conv, sender));
+  }
+
   // ---- 事件处理 ----
   private handleEvent(ev: OneBotMessage): void {
     if (!this.host || this.stopped) return;
@@ -1245,13 +1303,29 @@ export class QQWorld implements World {
       return;
     }
     if (ev.post_type !== 'message' && ev.post_type !== 'message_sent') return;
-    if (ev.post_type === 'message_sent') return; // 忽略自己发出的回显，避免回环
     const kind = ev.message_type === 'private' ? 'private' : 'group';
     const id = kind === 'group' ? ev.group_id! : ev.user_id!;
+    if (!this.isListened(kind, id)) return;
+    // 断档观测：自己的回显也推进游标与群序号；普通消息在推进前先判断是否跳档。
+    const address = `${kind}:${id}`;
+    if (this.gaps) {
+      if (ev.post_type === 'message') {
+        const seq = Number(ev.message_seq);
+        const anchor = this.gaps.cursorMessageId(address);
+        const gapped = this.gaps.gapBefore(address, seq);
+        this.gaps.observeIncoming(address, ev);
+        if (gapped) {
+          this.log.info('群消息序号跳档，开始补收', { address, seq });
+          this.gaps.recover(address, anchor);
+        }
+      } else {
+        this.gaps.observeIncoming(address, ev);
+        return; // 忽略自己发出的回显，避免回环
+      }
+    } else if (ev.post_type === 'message_sent') return;
     // 自己回声丢弃（双重保险：NapCat reverse 有时把自身消息以普通 message 回报，
     // 且 identity 偶发未加载，故同时用事件自带的 self_id 判定 sender===self，过滤更稳健）。
     if ((this.identity && Number(ev.user_id) === this.identity.selfId) || Number(ev.user_id) === Number(ev.self_id)) return;
-    if (!this.isListened(kind, id)) return;
     const conv = this.ensureConv(kind, id);
     conv.lastMessageAt = Date.now();
     this.proactive?.notifyReply(conv.address);
@@ -2114,6 +2188,7 @@ export class QQWorld implements World {
     if (messageId == null) return;
     const id = String(messageId);
     this.knownMessages.set(id, { conv: address, ts: Date.now() });
+    this.gaps?.noteSent(address, Number(id));
     ids?.push(id);
     this.scheduleSaveState();
   }

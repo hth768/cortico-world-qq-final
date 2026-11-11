@@ -35,6 +35,17 @@ export interface QQAsrConfig {
   transcribeTimeout: number;
 }
 
+/** 断档补收：连接断开/协议端掉线时漏掉的消息，用 OneBot 历史接口按会话补回来。
+ *  私聊补回后照常投递并要求回复；群聊补回时超过 stale 时限的只进未读箱、不唤醒。 */
+export interface QQGapRecoveryConfig {
+  /** 总开关；关闭后不补收、不写游标。 */
+  enabled: boolean;
+  /** 群聊补档超过多少分钟就算“太久”：只归档不唤醒，不要求回复。 */
+  groupStaleMinutes: number;
+  /** 单个会话一次最多补多少条（防止长时间离线后一次灌爆上下文）。 */
+  maxMessages: number;
+}
+
 export interface QQWorldConfig {
   /** 连接模式：reverse=Cortico 开 WS 服务端等 NapCat 连（fat-fish 风格）；forward=Cortico 连 NapCat 的 wsUrl（内置风格）。 */
   mode: 'reverse' | 'forward';
@@ -54,6 +65,8 @@ export interface QQWorldConfig {
   privateAggregationWindow: number;
   /** passive 保持自动投递；active 完全主动查收；hybrid 仅私聊/@自己/戳自己实时投递。 */
   receiveMode: 'passive' | 'active' | 'hybrid';
+  /** 断档补收：连接中断期间协议端没推过来的消息，用 OneBot 历史接口补回来。 */
+  gapRecovery: QQGapRecoveryConfig;
   /** 连续消息最大间隔（ms），超出视为新主题（fat-fish MAX_SEQUENCE_GAP）。 */
   maxSequenceGap: number;
   /** 引用回看窗口（秒），fat-fish REPLY_MAX_GAP_SEC。 */
@@ -284,6 +297,12 @@ export const QQ_DEFAULTS: QQWorldConfig = {
   privates: [],
   privateAggregationWindow: 0,
   receiveMode: 'hybrid',
+  gapRecovery: {
+    enabled: true,
+    // 群聊补档超过 30 分钟视为“太久”：只进未读箱，不要求回复；私聊不受此限。
+    groupStaleMinutes: 30,
+    maxMessages: 120,
+  },
   maxSequenceGap: 8000,
   replyMaxGapSec: 600,
   maxMessageBytes: 1500,
@@ -466,6 +485,18 @@ export const QQ_CONFIG_GROUP: ConfigGroup = {
       'worlds.qqbot.receiveMode': {
         type: 'string', title: '消息接收模式', enum: ['hybrid', 'active', 'passive'], 'x-hot': false,
         description: 'hybrid=混合（默认），私聊/@自己/戳自己实时投递，其余主动查收；active=主动查收，私聊、群聊、@、戳一戳和空间评论只存未读箱，不逐条唤醒；passive=被动投递，沿用原自动投递行为。主动模式同时暂停随机主动闲聊和空间自动发帖/回复；明确设置的闹钟仍生效。未读箱没有默认定时唤醒，可由 bot 通过 qq_inbox 预约一次查收提醒。改完重启扩展。',
+      },
+      'worlds.qqbot.gapRecovery.enabled': {
+        type: 'boolean', title: '断档补收', 'x-hot': true,
+        description: '连接断开、协议端掉线或 QQ 漏推期间缺失的消息，重连时用 OneBot 历史接口（get_group_msg_history / get_friend_msg_history）补回来；运行中群消息序号跳档也会立即补。补回的私聊照常投递并要求回复；群聊超过「补档时限」的只进未读箱，不唤醒、不要求回复。需要协议端支持历史接口（SnowLuma 会从 QQ 服务器回源）。',
+      },
+      'worlds.qqbot.gapRecovery.groupStaleMinutes': {
+        type: 'integer', title: '群聊补档时限(分钟)', minimum: 1, maximum: 1440, 'x-hot': true,
+        description: '补回的群消息距现在超过多少分钟就不唤醒、不要求回复（仅存入未读箱供 bot 自行查收）。默认 30 分钟。',
+      },
+      'worlds.qqbot.gapRecovery.maxMessages': {
+        type: 'integer', title: '单会话最多补收', minimum: 1, maximum: 200, 'x-hot': true,
+        description: '单个会话一次最多补多少条，防止长时间离线后一次灌爆上下文。默认 120 条。',
       },
       'worlds.qqbot.deliverImageAttachments': { type: 'boolean', title: '图片作为模型附件', 'x-hot': true, description: '开启时把收到的图片直接作为附件喂给主模型（主模型需支持看图）。这是默认的看图路径；「辅助视觉」是另一条用独立 VLM 描述图片的路，两条同时开会重复花钱，主模型能看图时就留着这个、关掉辅助视觉。' },
       'worlds.qqbot.emojiDir': { type: 'string', title: '表情包目录', 'x-hot': false, description: '本地表情包图片目录（相对部署数据目录或绝对路径），供发送 [表情包:文件名] 标记。' },
@@ -658,6 +689,17 @@ export function normalizeConfig(raw: QQConfigSection): QQWorldConfig {
   c.privates = toIds(c.privates);
   if (typeof c.privateAggregationWindow !== 'number') c.privateAggregationWindow = QQ_DEFAULTS.privateAggregationWindow;
   if (!['passive', 'active', 'hybrid'].includes(c.receiveMode as string)) c.receiveMode = QQ_DEFAULTS.receiveMode;
+  // gapRecovery 子对象原地合并，保持引用身份（x-hot 生效）
+  const gr = (c.gapRecovery && typeof c.gapRecovery === 'object' ? c.gapRecovery : {}) as QQGapRecoveryConfig & Record<string, unknown>;
+  c.gapRecovery = gr;
+  Object.assign(gr, { ...QQ_DEFAULTS.gapRecovery, ...gr });
+  if (typeof gr.enabled !== 'boolean') gr.enabled = QQ_DEFAULTS.gapRecovery.enabled;
+  if (typeof gr.groupStaleMinutes !== 'number' || !Number.isFinite(gr.groupStaleMinutes) || gr.groupStaleMinutes < 0) {
+    gr.groupStaleMinutes = QQ_DEFAULTS.gapRecovery.groupStaleMinutes;
+  }
+  if (typeof gr.maxMessages !== 'number' || !Number.isFinite(gr.maxMessages) || gr.maxMessages < 1) {
+    gr.maxMessages = QQ_DEFAULTS.gapRecovery.maxMessages;
+  }
   if (typeof c.maxSequenceGap !== 'number') c.maxSequenceGap = QQ_DEFAULTS.maxSequenceGap;
   if (typeof c.replyMaxGapSec !== 'number') c.replyMaxGapSec = QQ_DEFAULTS.replyMaxGapSec;
   if (typeof c.maxMessageBytes !== 'number') c.maxMessageBytes = QQ_DEFAULTS.maxMessageBytes;

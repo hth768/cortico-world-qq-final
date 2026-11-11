@@ -21,6 +21,8 @@ export interface OneBotMessage {
   message_type?: 'private' | 'group';
   sub_type?: string;
   message_id?: number;
+  /** 服务器消息序号（群聊为 NT seq，私聊为发送端本地序号）。 */
+  message_seq?: number;
   group_id?: number;
   user_id?: number;
   target_id?: number;
