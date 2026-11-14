@@ -2,6 +2,7 @@
 
 export type OneBotSegment =
   | { type: 'text'; data: { text: string } }
+  | { type: 'markdown'; data: { content?: string } }
   | { type: 'at'; data: { qq: number | string; name?: string } }
   | { type: 'face'; data: { id: number | string } }
   | { type: 'image'; data: { file: string; url?: string; summary?: string } }
@@ -21,6 +22,8 @@ export interface OneBotMessage {
   message_type?: 'private' | 'group';
   sub_type?: string;
   message_id?: number;
+  /** 服务器消息序号（群聊为 NT seq，私聊为发送端本地序号）。 */
+  message_seq?: number;
   group_id?: number;
   user_id?: number;
   target_id?: number;

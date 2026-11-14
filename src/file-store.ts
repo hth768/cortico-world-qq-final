@@ -1,6 +1,6 @@
 import { IndexedMediaFiles } from './indexed-media.ts';
-import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
+import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { extname, join, relative, resolve } from 'node:path';
 import type { Logger } from 'cortico/core/types.ts';
 import { isIP } from 'node:net';
@@ -57,6 +57,8 @@ export class FileStore {
   private readonly log: Logger;
   private readonly indexFile: string;
   private readonly meta = new Map<string, FileMeta>();
+  private diskMeta = new Map<string, FileMeta>();
+  private diskText: string | undefined;
   private saveTimer: ReturnType<typeof setTimeout> | undefined;
 
   constructor(dir: string, log: Logger, dataDir = '', maxBytes = DEFAULT_MAX_BYTES) {
@@ -71,13 +73,21 @@ export class FileStore {
     } catch {
       this.log.warn('无法创建文件资料库目录', { dir: this.dir });
     }
-    this.load();
+    this.refresh();
   }
 
-  get size(): number { return this.indexedFiles.availableCount(this.meta.size); }
-  flush(): void { this.save(); }
+  get size(): number {
+    this.refresh();
+    return [...this.meta.values()].filter(m => this.available(m)).length;
+  }
+  flush(): void {
+    clearTimeout(this.saveTimer);
+    this.saveTimer = undefined;
+    this.save();
+  }
   recent(limit = 10): FileMeta[] {
-    return [...this.meta.values()].filter(m => this.indexedFiles.available(m)).sort((a, b) => b.lastSaved - a.lastSaved).slice(0, Math.max(1, Math.min(50, Math.floor(limit)))).map((m) => ({ ...m }));
+    this.refresh();
+    return [...this.meta.values()].filter(m => this.available(m)).sort((a, b) => b.lastSaved - a.lastSaved).slice(0, Math.max(1, Math.min(50, Math.floor(limit)))).map((m) => ({ ...m }));
   }
 
   async saveUrl(url: string, name = '', patch: FilePatch = {}): Promise<FileStoreResult> {
@@ -87,6 +97,7 @@ export class FileStore {
 
   saveBytes(bytes: Uint8Array, name = '', patch: FilePatch = {}): FileStoreResult {
     if (bytes.byteLength > this.maxBytes) return { ok: false, error: `文件超过 ${Math.floor(this.maxBytes / 1024 / 1024)} MiB 大小上限。` };
+    this.refresh();
     const hash = createHash('sha256').update(bytes).digest('hex');
     const ext = this.extOf(name, bytes);
     const file = `file-${hash.slice(0, 16)}${ext}`;
@@ -142,7 +153,7 @@ export class FileStore {
     if (!m) return null;
     try {
       const path = this.safePath(m.file);
-      if (!existsSync(path) || !realpathSync(path)) return null;
+      if (!statSync(path).isFile()) return null;
       return path;
     } catch { return null; }
   }
@@ -153,10 +164,17 @@ export class FileStore {
   }
 
   private find(file: string): FileMeta | null {
+    this.refresh();
     const raw = typeof file === 'string' ? file.trim() : '';
     const key = this.cleanField(raw.replace(/^\[文件:/i, '').replace(/\]$/, ''), 120).toLowerCase();
     if (!FILE_RE.test(key)) return null;
     return [...this.meta.values()].find((m) => m.file.toLowerCase() === key) ?? null;
+  }
+
+  private available(meta: FileMeta): boolean {
+    if (!/^[a-f0-9]{64}$/.test(meta.hash) || !meta.file.startsWith(`file-${meta.hash.slice(0, 16)}.`)) return false;
+    try { return lstatSync(this.safePath(meta.file)).isFile(); }
+    catch { return false; }
   }
 
   private safePath(file: string): string {
@@ -234,18 +252,53 @@ export class FileStore {
     } catch { return null; } finally { clearTimeout(timer); }
   }
 
-  private load(): void {
-    if (!this.indexFile) return;
+  /** 用上次磁盘快照作基线，合并外部编辑与尚未落盘的本地修改。 */
+  private refresh(): boolean {
+    if (!this.indexFile) return true;
     try {
-      const raw = JSON.parse(readFileSync(this.indexFile, 'utf8')) as unknown;
-      if (!Array.isArray(raw)) return;
-      for (const item of raw) {
-        if (!item || typeof item !== 'object') continue;
-        const m = item as FileMeta;
-        if (typeof m.hash !== 'string' || !FILE_RE.test(String(m.file)) || typeof m.size !== 'number') continue;
-        this.meta.set(m.hash, { ...m, file: String(m.file), name: this.cleanFileName(m.name) || String(m.file), label: this.cleanField(m.label) || '文件', tag: this.cleanField(m.tag), usage: this.cleanField(m.usage), count: Math.max(1, Number(m.count) || 1) });
+      const text = readFileSync(this.indexFile, 'utf8');
+      if (text === this.diskText) {
+        if (!this.saveTimer && JSON.stringify([...this.meta]) !== JSON.stringify([...this.diskMeta])) this.scheduleSave();
+        return true;
       }
-    } catch { /* 首次运行或损坏索引均从空库开始 */ }
+      const raw = JSON.parse(text.replace(/^\uFEFF/, '')) as unknown;
+      if (!Array.isArray(raw)) throw new Error('文件索引必须是 JSON 数组');
+      const disk = new Map<string, FileMeta>();
+      for (const item of raw) {
+        if (!item || typeof item !== 'object' || Array.isArray(item)) throw new Error('文件索引条目格式错误');
+        const m = item as FileMeta;
+        if (typeof m.hash !== 'string' || !FILE_RE.test(String(m.file)) || typeof m.size !== 'number') throw new Error('文件索引条目格式错误');
+        disk.set(m.hash, { ...m, file: String(m.file), name: this.cleanFileName(m.name) || String(m.file), label: this.cleanField(m.label) || '文件', tag: this.cleanField(m.tag), usage: this.cleanField(m.usage), count: Math.max(1, Number(m.count) || 1) });
+      }
+      const merged = new Map([...disk].map(([hash, m]) => [hash, { ...m }]));
+      for (const [hash, local] of this.meta) {
+        const base = this.diskMeta.get(hash);
+        if (!base) {
+          merged.set(hash, { ...local });
+          continue;
+        }
+        for (const field of Object.keys(local) as (keyof FileMeta)[]) {
+          if (local[field] === base[field]) continue;
+          const entry = merged.get(hash) ?? { ...local };
+          Object.assign(entry, { [field]: local[field] });
+          merged.set(hash, entry);
+        }
+      }
+      // 本地删除优先，避免磁盘上的旧条目让已删除文件重新出现。
+      for (const hash of this.diskMeta.keys()) {
+        if (!this.meta.has(hash)) merged.delete(hash);
+      }
+      this.meta.clear();
+      for (const [hash, m] of merged) this.meta.set(hash, m);
+      this.diskMeta = disk;
+      this.diskText = text;
+      if (JSON.stringify([...merged]) !== JSON.stringify([...disk])) this.scheduleSave();
+      return true;
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === 'ENOENT' && this.diskText === undefined) return true;
+      this.log.warn('文件索引暂不可读，保留内存资料并暂停写回', { err: String(e) });
+      return false;
+    }
   }
 
   private scheduleSave(): void {
@@ -254,18 +307,26 @@ export class FileStore {
   }
 
   private save(): void {
-    if (!this.indexFile) return;
+    if (!this.indexFile || !this.refresh()) return;
+    const tmp = `${this.indexFile}.${randomUUID()}.tmp`;
     try {
-      const tmp = `${this.indexFile}.tmp`;
-      writeFileSync(tmp, JSON.stringify([...this.meta.values()], null, 2), { encoding: 'utf8', mode: 0o600 });
-      renameSync(tmp, this.indexFile);
-    } catch (e) {
-      // Windows 沙箱/杀毒软件偶尔会短暂占用临时文件；回退到直接写入，避免资料库只剩 .tmp。
-      try {
-        writeFileSync(this.indexFile, JSON.stringify([...this.meta.values()], null, 2), { encoding: 'utf8', mode: 0o600 });
-      } catch {
-        this.log.warn('文件资料库索引保存失败', { err: String(e) });
+      const text = JSON.stringify([...this.meta.values()], null, 2);
+      writeFileSync(tmp, text, { encoding: 'utf8', mode: 0o600 });
+      // 临时文件写入期间若索引又被修改，下一次保存重新合并。
+      const current = existsSync(this.indexFile) ? readFileSync(this.indexFile, 'utf8') : undefined;
+      if (current !== this.diskText) {
+        this.scheduleSave();
+        return;
       }
+      renameSync(tmp, this.indexFile);
+      this.diskText = text;
+      this.diskMeta = new Map([...this.meta].map(([hash, m]) => [hash, { ...m }]));
+      clearTimeout(this.saveTimer);
+      this.saveTimer = undefined;
+    } catch (e) {
+      this.log.warn('文件资料库索引保存失败，保留待保存修改', { err: String(e) });
+    } finally {
+      try { unlinkSync(tmp); } catch { /* 成功重命名后临时文件已不存在 */ }
     }
   }
 }

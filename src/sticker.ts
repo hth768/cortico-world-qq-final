@@ -1,3 +1,4 @@
+import { downloadBytes } from './download.ts';
 import { IndexedMediaFiles } from './indexed-media.ts';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, unlinkSync, readFileSync, writeFileSync } from 'node:fs';
@@ -403,30 +404,7 @@ export class StickerStore {
   }
 
   private async fetchBytes(url: string, manual = false): Promise<Uint8Array | null> {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), this.vision.timeoutMs);
-    try {
-      const res = await fetch(url, { signal: ctrl.signal, redirect: manual ? 'error' : 'follow' });
-      if (!res.ok) return null;
-      if (!res.body || Number(res.headers.get('content-length')) > this.vision.maxBytes) { ctrl.abort(); return null; }
-      const chunks: Uint8Array[] = [];
-      let size = 0;
-      const reader = res.body.getReader();
-      try {
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          size += value.byteLength;
-          if (size > this.vision.maxBytes) { await reader.cancel(); return null; }
-          chunks.push(value);
-        }
-      } finally { reader.releaseLock(); }
-      return Buffer.concat(chunks, size);
-    } catch {
-      return null;
-    } finally {
-      clearTimeout(timer);
-    }
+    return downloadBytes(url, this.vision.maxBytes, this.vision.timeoutMs, manual ? 'error' : 'follow');
   }
 
   private load(): void {

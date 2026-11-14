@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { QQWorld } from '../src/world.ts';
 import { QQ_DEFAULTS } from '../src/config.ts';
+import sharp from 'sharp';
 
 // 可用同一组行为测试校验实际打包入口；仍只连接假宿主与假协议端。
 const releaseRoot = process.env.QQ_FINAL_TEST_PACKAGE;
@@ -100,7 +101,8 @@ test('长消息不会被资料包装静默截断，超大批次提前分页且�
 test('延迟处理图片和转发，读取时返回附件和原文，无后续唤醒', async (t) => {
   const f = fixture(t);
   let downloads = 0;
-  f.world.fetchBytes = async () => { downloads++; return new Uint8Array([1, 2, 3]); };
+  const picture = await sharp({ create: { width: 8, height: 8, channels: 3, background: 'red' } }).png().toBuffer();
+  f.world.fetchBytes = async () => { downloads++; return picture; };
   await f.deliver(message(1, { message: [{ type: 'image', data: { file: 'image.jpg', url: 'https://example.com/image.jpg' } }] }));
   await f.deliver(message(2, { message: [{ type: 'forward', data: { id: 'forward1' } }] }));
   assert.equal(downloads, 0);
@@ -352,6 +354,39 @@ test('空间显式附图全部有效才发布：不静默丢图，也不替换�
   assert.deepEqual(calls, [[inline,inline,inline,data],[],['https://example.org/recent.png']]);
 });
 
+test('运行中外部导入文件后 qq_file list 和 send 立即生效，保存保留外部条目', async (t) => {
+  const { createHash } = await import('node:crypto');
+  const { writeFileSync } = await import('node:fs');
+  const f = fixture(t, 'active', { asr: { ...QQ_DEFAULTS.asr, mode: 'off' }, sendIntervalMs: 0 });
+  const calls: any[] = [];
+  f.world.createDriver = () => ({ start: async () => {}, stop: async () => {}, callApi: async (action: string, params: any) => {
+    calls.push({ action, params });
+    return {};
+  } });
+  await f.world.start(f.world.host);
+  const store = f.world.files;
+  store.saveBytes(Buffer.from('existing'), 'existing.txt');
+  store.flush();
+  const bytes = Buffer.from('new markdown document');
+  const hash = createHash('sha256').update(bytes).digest('hex');
+  const file = `file-${hash.slice(0, 16)}.md`;
+  const index = join(f.world.dataDir, 'file-index.json');
+  const rows = JSON.parse(readFileSync(index, 'utf8'));
+  rows.push({ hash, file, ext: '.md', name: 'new.md', size: bytes.length, label: '新增文档', tag: '', usage: '', count: 1, firstSaved: Date.now(), lastSaved: Date.now() });
+  writeFileSync(join(f.world.fileDirAbs, file), bytes);
+  writeFileSync(index, JSON.stringify(rows));
+  const invoke = (args: any) => f.world.tools().find((tool: any) => tool.name === 'qq_file').handler(args, {});
+  assert.ok((await invoke({ action: 'list' })).includes(file));
+  for (const to of ['private:23456', 'group:12345']) {
+    assert.match(await invoke({ action: 'send', file, to }), /发送文件/);
+  }
+  const uploads = calls.filter(call => call.action.startsWith('upload_'));
+  assert.deepEqual(uploads.map(call => call.action), ['upload_private_file', 'upload_group_file']);
+  assert.ok(uploads.every(call => call.params.file === join(f.world.fileDirAbs, file) && call.params.name === 'new.md'));
+  store.flush();
+  assert.equal(JSON.parse(readFileSync(index, 'utf8')).length, 2);
+});
+
 test('升级：新目录优先，只恢复本部署索引匹配的旧文件，缺图可重新收藏', async (t) => {
   const { createHash } = await import('node:crypto');
   const { mkdirSync, writeFileSync, existsSync } = await import('node:fs');
@@ -398,4 +433,144 @@ test('升级：新目录优先，只恢复本部署索引匹配的旧文件，�
   w.driver.callApi=async (_: string,args: any)=>{sent.push(...args.message);return {message_id:111};};
   await w.sendTo('private:23456','字面示例：\\[图片:missing.gif]');
   assert.equal(sent[0].data.text,'字面示例：[图片:missing.gif]');
+});
+
+
+test('未读 newest 返回最新一页且报告跳过范围，失败保留旧积压，clear 不返回正文', async (t) => {
+  const f = fixture(t);
+  for (let id = 1; id <= 8; id++) await f.deliver(message(id));
+  f.fail(true);
+  assert.equal((await f.call({action:'read', conversation:'group:12345', limit:2, order:'newest'})).failed, true);
+  assert.equal(JSON.parse(await f.call({action:'peek'})).total, 8);
+  f.fail(false);
+  const result = await f.call({action:'read', conversation:'group:12345', limit:2, order:'newest'});
+  const receipt = JSON.parse(result.text.split('\n')[0]);
+  assert.equal(receipt.read, 2);
+  assert.equal(receipt.skipped, 6);
+  assert.equal(receipt.remaining, 0);
+  assert.ok(result.text.indexOf('外部正文-7') < result.text.indexOf('外部正文-8'));
+  assert.doesNotMatch(result.text, /外部正文-1/);
+  await f.deliver(message(9));
+  const count = f.events.length;
+  assert.equal((await f.call({action:'clear'})).failed, true);
+  const cleared = await f.call({action:'clear', conversation:'all'});
+  assert.equal(JSON.parse(cleared).cleared, 1);
+  assert.doesNotMatch(cleared, /外部正文/);
+  assert.equal(f.events.length, count);
+});
+
+test('混合模式关键词、引用自己与差集补齐；主动模式仍只入箱', async (t) => {
+  const f = fixture(t, 'hybrid', {triggerKeywords:['鱼宝', '('], replyWake:true, historyBackfillLimit:2});
+  for (let id=1; id<=3; id++) await f.deliver(message(id));
+  await f.deliver(message(4, {message:[{type:'text',data:{text:'鱼宝你好'}}]}));
+  assert.equal(f.events.length,1);
+  assert.match(f.events[0].text,/外部正文-2/);
+  assert.match(f.events[0].text,/更早 1 条已省略/);
+  await f.deliver(message(5, {message:[{type:'text',data:{text:'('}}]}));
+  assert.doesNotMatch(f.events[1].text,/外部正文-2|鱼宝你好/);
+  f.world.rememberSentMessage('group:12345',{message_id:90});
+  f.world.saveState();
+  f.world.knownMessages.clear();
+  f.world.loadState();
+  await f.deliver(message(6,{message:[{type:'reply',data:{id:90}},{type:'text',data:{text:'引用回应'}}]}));
+  assert.equal(f.events.length,3);
+  f.config.receiveMode='active';
+  await f.deliver(message(7,{message:[{type:'text',data:{text:'鱼宝'}}]}));
+  assert.equal(f.events.length,3);
+});
+
+test('群输入节流合并到一次事件，clear 会取消待投递；私聊实时', async (t) => {
+  const f=fixture(t,'passive',{inputMinIntervalSec:0.08,inputMaxMessagesPerWindow:3});
+  await f.deliver(message(1));
+  await f.deliver(message(2));
+  await f.deliver(message(3));
+  assert.equal(f.events.length,1);
+  await f.deliver(message(4,{message_type:'private',group_id:undefined}));
+  assert.equal(f.events.length,2);
+  await new Promise(r=>setTimeout(r,120));
+  await f.world.msgChain;
+  assert.equal(f.events.length,3);
+  assert.match(f.events[2].text,/外部正文-2/);
+  assert.match(f.events[2].text,/外部正文-3/);
+  await f.deliver(message(5));
+  await f.call({action:'clear',conversation:'group:12345'});
+  await new Promise(r=>setTimeout(r,120));
+  await f.world.msgChain;
+  assert.equal(f.events.length,3);
+});
+
+test('长图分段为合法 JPEG，引用图片也走相同处理', async (t) => {
+  const f=fixture(t,'passive');
+  const bytes=await sharp({create:{width:1880,height:8805,channels:3,background:'white'}}).png().toBuffer();
+  f.world.fetchBytes=async()=>bytes;
+  await f.deliver(message(1,{message:[{type:'image',data:{url:'https://example.com/long.png'}}]}));
+  assert.equal(f.events[0].blobs.length,4);
+  for(const blob of f.events[0].blobs){
+    const meta=await sharp(blob.bytes).metadata();
+    assert.equal(meta.format,'jpeg');
+    assert.ok(meta.width!<=2048 && meta.height!<=2048);
+    assert.equal(blob.mime,'image/jpeg');
+  }
+  f.world.driver.callApi=async()=>({sender:{user_id:23456},message:[{type:'image',data:{url:'https://example.com/long.png'}}]});
+  assert.equal((await f.world.resolveQuoted(1)).blobs.length,4);
+});
+
+test('本地 QQ 收藏接受路径和 result=0，失败回退 base64 并清理临时文件', async (t) => {
+  const {existsSync}=await import('node:fs');
+  const f=fixture(t,'active',{imageTransport:'path',sticker:{...QQ_DEFAULTS.sticker,addToQQFavorites:true}});
+  const files:string[]=[];
+  f.world.driver.callApi=async (_:string,p:any)=>{files.push(p.file); assert.ok(existsSync(p.file)); return {result:0,isExist:0};};
+  assert.equal(await f.world.pushStickerToQQFavorites(Buffer.from('GIF89a'),'.gif'),'protocol-confirmed');
+  assert.equal(existsSync(files[0]),false);
+  f.world.driver.callApi=async (_:string,p:any)=>{files.push(p.file); if(!p.file.startsWith('base64://')) throw Error('path unavailable'); return {emoji_id:'42'};};
+  assert.equal(await f.world.pushStickerToQQFavorites(Buffer.from('GIF89a'),'.gif'),'42');
+  assert.equal(existsSync(files[1]),false);
+  assert.ok(files[2].startsWith('base64://'));
+});
+
+test('合并转发截断提供总数与省略提示', async (t) => {
+  const f=fixture(t,'passive');
+  f.world.driver.getForwardMessages=async()=>Object.assign([{sender:{user_id:23456,nickname:'用户'},message:[{type:'text',data:{text:'转发正文'}}]}],{total:25});
+  await f.deliver(message(1,{message:[{type:'forward',data:{id:'f'}}]}));
+  const forward=f.events.find(e=>e.type==='qq.forward');
+  assert.equal(forward.meta.total,25);
+  assert.equal(forward.meta.truncated,true);
+  assert.match(forward.text,/另有 24 条未展开/);
+});
+
+test('PR22 拆句保留 at 与 markdown 正文可读', async () => {
+  const {splitReplyIntoMessages,renderIncoming,renderSegmentsPlain}=await import('../src/normalize.ts');
+  const groups=splitReplyIntoMessages([{type:'at',data:{qq:23456}},{type:'text',data:{text:'第一句。\n第二句。'}}],{splitBySentence:true,sentencesPerMessage:1,maxBytes:1500});
+  assert.equal(groups[0][0].type,'at');
+  assert.equal(groups.flat().filter(s=>s.type==='at').length,1);
+  const segments=[{type:'markdown',data:{content:'## **欢迎**\n[@用户](mqqapi://mention)\n![图片](https://example.com/a.png)'}}];
+  assert.match(renderIncoming(segments,{timezone:'Asia/Shanghai',selfId:1}),/欢迎\n@用户\n\[图片\]/);
+  assert.doesNotMatch(renderSegmentsPlain(segments),/mqqapi/);
+});
+
+test('断档补回遵循主动与混合接收模式，关闭或停用后不再处理', async (t) => {
+  const f=fixture(t,'active');
+  await f.world.deliverRecovered('private:23456',message(100,{message_type:'private',group_id:undefined}),false);
+  assert.equal(f.events.length,0);
+  assert.equal(JSON.parse(await f.call({action:'peek'})).total,1);
+  f.config.receiveMode='hybrid';
+  await f.world.deliverRecovered('group:12345',message(101),false);
+  assert.equal(f.events.length,0);
+  await f.world.deliverRecovered('private:23456',message(102,{message_type:'private',group_id:undefined}),false);
+  assert.equal(f.events.length,1);
+  f.config.gapRecovery.enabled=false;
+  await f.world.deliverRecovered('private:23456',message(103,{message_type:'private',group_id:undefined}),false);
+  assert.equal(f.events.length,1);
+});
+
+
+test('实际 qq_send 拆句后 atPosition=tail 把 @ 放在末条文字末尾', async (t) => {
+  const f=fixture(t,'passive',{atPosition:'tail',sendIntervalMs:0});
+  const sent:any[]=[];
+  f.world.driver.callApi=async (_:string,args:any)=>{sent.push(args.message);return {message_id:sent.length};};
+  const tool=f.world.tools().find((tool:any)=>tool.name==='qq_send');
+  await tool.handler({to:'group:12345',text:'第一句。第二句。',at:['23456']},{});
+  assert.equal(sent.length,2);
+  assert.equal(sent[1].at(-1).type,'at');
+  assert.equal(sent.flat().filter((s:any)=>s.type==='at').length,1);
 });

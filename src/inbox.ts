@@ -10,7 +10,7 @@ export type InboxItem = InboxPayload & { id: number; address: string; receivedAt
 export const INBOX_LIMITS = { perConversation: 200, total: 2000, bytes: 16 * 1024 * 1024, entryBytes: 256 * 1024, ageMs: 7 * 86400_000 };
 
 /** 混合模式只让私聊、明确 @ 自己和戳自己实时到达；主动模式无逐条唤醒例外。 */
-export function shouldQueue(mode: ReceiveMode, ev: OneBotMessage, selfId: number): boolean {
+export function shouldQueue(mode: ReceiveMode, ev: OneBotMessage, selfId: number, wake: { keywords?: string[]; replyToSelf?: boolean } = {}): boolean {
   if (mode === 'passive') return false;
   if (mode === 'active') return true;
   if (ev.post_type === 'message') {
@@ -18,7 +18,11 @@ export function shouldQueue(mode: ReceiveMode, ev: OneBotMessage, selfId: number
     const at = Array.isArray(ev.message)
       ? ev.message.some((s) => s.type === 'at' && selfId > 0 && Number(s.data.qq) === selfId)
       : selfId > 0 && new RegExp(`\\[CQ:at,qq=${selfId}(?:,|\\])`).test(ev.message ?? '');
-    return !at;
+    const text = (Array.isArray(ev.message)
+      ? ev.message.filter(s => s.type === 'text').map(s => String(s.data.text ?? '')).join('')
+      : String(ev.message ?? '').replace(/\[CQ:[^\]]*\]/g, '')).toLocaleLowerCase();
+    const keyword = wake.keywords?.some(word => word.length > 0 && text.includes(word.toLocaleLowerCase()));
+    return !(at || keyword || wake.replyToSelf);
   }
   if (ev.notice_type === 'notify' && ev.sub_type === 'poke') {
     const target = Number(ev.target_id) || 0;
@@ -110,16 +114,25 @@ export class QQInbox {
     return { total: this.items.length, conversations: [...conversations.values()], dropped: this.dropped, checkAt: this.checkAt };
   }
 
-  select(address: string, limit: number): InboxItem[] {
+  select(address: string, limit: number, order: 'oldest' | 'newest' = 'oldest'): InboxItem[] {
     this.trim();
     const page: InboxItem[] = [];
     let bytes = 0;
-    for (const item of this.items) {
+    for (const item of order === 'newest' ? [...this.items].reverse() : this.items) {
       if (item.address !== address) continue;
       if (page.length >= limit || page.length > 0 && bytes + item.bytes > 64 * 1024) break;
       page.push(item); bytes += item.bytes;
     }
-    return page;
+    return order === 'newest' ? page.reverse() : page;
+  }
+
+  clear(address: string, beforeId = Infinity) {
+    this.trim();
+    const removed = this.items.filter(i => (address === 'all' || i.address === address) && i.id < beforeId);
+    const ids = new Set(removed.map(i => i.id));
+    this.items = this.items.filter(i => !ids.has(i.id));
+    if (removed.length) this.changed();
+    return { skipped: removed.length, skippedFrom: removed[0]?.receivedAt ?? null, skippedTo: removed.at(-1)?.receivedAt ?? null };
   }
 
   acknowledge(id: number): void {

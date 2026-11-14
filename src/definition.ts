@@ -7,8 +7,8 @@ import { qqDefaults, qqTimezoneOptions, type QQConfigSection } from './config.ts
 /** 每个工具一句给人看的话;市场与扩展页按界面语言取。 */
 const TOOL_SUMMARIES: Record<string, DescribeText> = {
   qq_inbox: {
-    zh: 'QQ 主动查收：看积压、按会话和条数读取、预约或取消一次查收提醒。',
-    en: 'QQ inbox: inspect unread counts, read a chosen conversation, or schedule/cancel a one-time check reminder.',
+    zh: 'QQ 主动查收：看积压、读最新或最早消息、清空未读、预约或取消查收提醒。',
+    en: 'QQ inbox: inspect counts, read newest or oldest messages, clear unread items, or schedule a check.',
   },
   qq_send: {
     zh: '回复 QQ 消息的唯一渠道:往群或私聊发一条消息,可引用回复、@人,由主模型决定是否转成语音。',
@@ -63,7 +63,7 @@ const TOOL_SUMMARIES: Record<string, DescribeText> = {
     en: 'Group admin: recall / mention-all / notice / review joins / title / mute / whole-mute / kick, picked by one action.',
   },
   qq_history: {
-    zh: '聊天历史:查最近消息(recent)或关键词检索(search)。',
+    zh: '本地已收录历史：查最近记录或关键词检索；积压未读通过 qq_inbox 查看。',
     en: 'Chat history: recent messages or keyword search.',
   },
 };

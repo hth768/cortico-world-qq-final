@@ -35,6 +35,17 @@ export interface QQAsrConfig {
   transcribeTimeout: number;
 }
 
+/** 断档补收：连接断开/协议端掉线时漏掉的消息，用 OneBot 历史接口按会话补回来。
+ *  私聊补回后照常投递并要求回复；群聊补回时超过 stale 时限的只进未读箱、不唤醒。 */
+export interface QQGapRecoveryConfig {
+  /** 总开关；关闭后不补收、不写游标。 */
+  enabled: boolean;
+  /** 群聊补档超过多少分钟就算“太久”：只归档不唤醒，不要求回复。 */
+  groupStaleMinutes: number;
+  /** 单个会话一次最多补多少条（防止长时间离线后一次灌爆上下文）。 */
+  maxMessages: number;
+}
+
 export interface QQWorldConfig {
   /** 连接模式：reverse=Cortico 开 WS 服务端等 NapCat 连（fat-fish 风格）；forward=Cortico 连 NapCat 的 wsUrl（内置风格）。 */
   mode: 'reverse' | 'forward';
@@ -54,6 +65,13 @@ export interface QQWorldConfig {
   privateAggregationWindow: number;
   /** passive 保持自动投递；active 完全主动查收；hybrid 仅私聊/@自己/戳自己实时投递。 */
   receiveMode: 'passive' | 'active' | 'hybrid';
+  triggerKeywords: string[];
+  replyWake: boolean;
+  historyBackfillLimit: number;
+  inputMinIntervalSec: number;
+  inputMaxMessagesPerWindow: number;
+  /** 断档补收：连接中断期间协议端没推过来的消息，用 OneBot 历史接口补回来。 */
+  gapRecovery: QQGapRecoveryConfig;
   /** 连续消息最大间隔（ms），超出视为新主题（fat-fish MAX_SEQUENCE_GAP）。 */
   maxSequenceGap: number;
   /** 引用回看窗口（秒），fat-fish REPLY_MAX_GAP_SEC。 */
@@ -76,6 +94,7 @@ export interface QQWorldConfig {
   deliverImageAttachments: boolean;
   /** 发送时按句拆分多条（fat-fish SPLIT_REPLY_BY_SENTENCE）。 */
   splitReplyBySentence: boolean;
+  atPosition: 'head' | 'tail';
   /** 每条消息最多容纳句数（fat-fish SENTENCES_PER_MESSAGE）。 */
   sentencesPerMessage: number;
   /** 逐条发送之间的间隔毫秒（fat-fish SEND_INTERVAL_SECONDS），0 表示不限速。 */
@@ -284,6 +303,17 @@ export const QQ_DEFAULTS: QQWorldConfig = {
   privates: [],
   privateAggregationWindow: 0,
   receiveMode: 'hybrid',
+  triggerKeywords: [],
+  replyWake: false,
+  historyBackfillLimit: 0,
+  inputMinIntervalSec: 0,
+  inputMaxMessagesPerWindow: 20,
+  gapRecovery: {
+    enabled: true,
+    // 群聊补档超过 30 分钟视为“太久”：只进未读箱，不要求回复；私聊不受此限。
+    groupStaleMinutes: 30,
+    maxMessages: 120,
+  },
   maxSequenceGap: 8000,
   replyMaxGapSec: 600,
   maxMessageBytes: 1500,
@@ -295,6 +325,7 @@ export const QQ_DEFAULTS: QQWorldConfig = {
   imageTransport: 'auto',
   deliverImageAttachments: true,
   splitReplyBySentence: true,
+  atPosition: 'head',
   sentencesPerMessage: 1,
   sendIntervalMs: 600,
   vision: {
@@ -467,7 +498,25 @@ export const QQ_CONFIG_GROUP: ConfigGroup = {
         type: 'string', title: '消息接收模式', enum: ['hybrid', 'active', 'passive'], 'x-hot': false,
         description: 'hybrid=混合（默认），私聊/@自己/戳自己实时投递，其余主动查收；active=主动查收，私聊、群聊、@、戳一戳和空间评论只存未读箱，不逐条唤醒；passive=被动投递，沿用原自动投递行为。主动模式同时暂停随机主动闲聊和空间自动发帖/回复；明确设置的闹钟仍生效。未读箱没有默认定时唤醒，可由 bot 通过 qq_inbox 预约一次查收提醒。改完重启扩展。',
       },
+      'worlds.qqbot.gapRecovery.enabled': {
+        type: 'boolean', title: '断档补收', 'x-hot': true,
+        description: '连接断开、协议端掉线或 QQ 漏推期间缺失的消息，重连时用 OneBot 历史接口（get_group_msg_history / get_friend_msg_history）补回来；运行中群消息序号跳档也会立即补。补回消息遵循当前接收模式；群聊超过「补档时限」的只进未读箱。需要协议端支持历史接口（SnowLuma 会从 QQ 服务器回源）。',
+      },
+      'worlds.qqbot.triggerKeywords': { type: 'string', title: '混合模式唤醒关键词', 'x-hot': true, description: '用逗号或换行分隔，大小写不敏感，只匹配消息正文。留空关闭关键词唤醒。' },
+      'worlds.qqbot.replyWake': { type: 'boolean', title: '引用自己时唤醒', 'x-hot': true, description: '混合模式下引用本扩展已记录的自发消息时实时投递。' },
+      'worlds.qqbot.historyBackfillLimit': { type: 'integer', title: '群聊唤醒附带新近消息', minimum: 0, maximum: 50, 'x-hot': true, description: '每次唤醒附带上次投递以来最多多少条群聊正文，0默认关闭，建议20；超出部分明确提示省略条数。' },
+      'worlds.qqbot.inputMinIntervalSec': { type: 'integer', title: '群聊输入最小间隔(秒)', minimum: 0, maximum: 3600, 'x-hot': true, description: '0关闭；间隔内的召唤先存未读箱，到期合并新近文字并投递最后一条召唤。私聊保持实时。' },
+      'worlds.qqbot.inputMaxMessagesPerWindow': { type: 'integer', title: '输入窗口最多附带条数', minimum: 1, maximum: 50, 'x-hot': true, description: '开启输入节流时，单次投递最多含多少条消息（含最后一条触发消息）；更早内容保留在未读箱。' },
+      'worlds.qqbot.gapRecovery.groupStaleMinutes': {
+        type: 'integer', title: '群聊补档时限(分钟)', minimum: 1, maximum: 1440, 'x-hot': true,
+        description: '补回的群消息距现在超过多少分钟就不唤醒、不要求回复（仅存入未读箱供 bot 自行查收）。默认 30 分钟。',
+      },
+      'worlds.qqbot.gapRecovery.maxMessages': {
+        type: 'integer', title: '单会话最多补收', minimum: 1, maximum: 200, 'x-hot': true,
+        description: '单个会话一次最多补多少条，防止长时间离线后一次灌爆上下文。默认 120 条。',
+      },
       'worlds.qqbot.deliverImageAttachments': { type: 'boolean', title: '图片作为模型附件', 'x-hot': true, description: '开启时把收到的图片直接作为附件喂给主模型（主模型需支持看图）。这是默认的看图路径；「辅助视觉」是另一条用独立 VLM 描述图片的路，两条同时开会重复花钱，主模型能看图时就留着这个、关掉辅助视觉。' },
+      'worlds.qqbot.forwardExpandLimit': { type: 'integer', title: '合并转发最多展开条数', minimum: 1, maximum: 200, 'x-hot': true, description: '默认 20；超过上限时正文和元数据会明确提示未展开条数。' },
       'worlds.qqbot.emojiDir': { type: 'string', title: '表情包目录', 'x-hot': false, description: '本地表情包图片目录（相对部署数据目录或绝对路径），供发送 [表情包:文件名] 标记。' },
       'worlds.qqbot.imageDir': { type: 'string', title: '图片库目录', 'x-hot': false, description: '本地图片库目录（相对部署数据目录或绝对路径），与表情包目录分开，供发送 [图片:文件名] 标记。' },
       'worlds.qqbot.fileDir': { type: 'string', title: '文件库目录', 'x-hot': false, description: '收到的普通文件保存目录（相对部署数据目录或绝对路径），与表情包和图片库分开；默认 files。' },
@@ -475,6 +524,7 @@ export const QQ_CONFIG_GROUP: ConfigGroup = {
       'worlds.qqbot.splitReplyBySentence': { type: 'boolean', title: '按句拆分发送', 'x-hot': true, description: '开启后回复按句标拆成多条消息（对齐 fat-fish）。' },
       'worlds.qqbot.forwardByMessageId': { type: 'boolean', title: '允许按消息 id 合并转发', 'x-hot': false, description: '开启后可使用 qq_forward_by_id 工具：把本 bot 已接收或已发出的多条消息，用 send_forward_msg 合成「一张合并转发卡片」发出（卡片由本 bot 发出，node 身份只能是 bot 自己；卡片内每条消息用文本标注原始发送者昵称+QQ号并保留原文内容，不伪造任何身份）。需要协议端支持 send_forward_msg 与 get_msg（NapCat/Lagrange/SnowLuma 等 OneBot v11 实现大多支持）。只能转发本 bot 见过的消息（message id 必须在本地记录内），无法转发从未见过的消息。' },
       'worlds.qqbot.sentencesPerMessage': { type: 'integer', title: '每条句数', minimum: 1, maximum: 10, 'x-hot': true },
+      'worlds.qqbot.atPosition': { type: 'string', title: '@ 放置位置', enum: ['head', 'tail'], 'x-hot': true, description: 'head默认放在第一条开头；tail放在最后一条文字消息末尾。' },
       'worlds.qqbot.sendIntervalMs': { type: 'integer', title: '发送间隔(ms)', minimum: 0, maximum: 5000, 'x-hot': true, description: '逐条发送之间的间隔，0 表示不限速。' },
       'worlds.qqbot.vision.enabled': { type: 'boolean', title: '开启辅助视觉', 'x-hot': false, description: '用另一个 VLM 描述图片。主模型本身能看图时不必开（图片已作为附件直达主模型，见「图片作为模型附件」）；仅当主模型不支持图片、或想用专门的视觉模型时才开。' },
             'worlds.qqbot.vision.endpoint': { type: 'string', title: '辅助视觉·模型地址', 'x-hot': false, description: 'VLM 的 OpenAI 兼容地址（如 https://api.deepseek.com/v1）。开启辅助视觉后必填。' },
@@ -658,13 +708,35 @@ export function normalizeConfig(raw: QQConfigSection): QQWorldConfig {
   c.privates = toIds(c.privates);
   if (typeof c.privateAggregationWindow !== 'number') c.privateAggregationWindow = QQ_DEFAULTS.privateAggregationWindow;
   if (!['passive', 'active', 'hybrid'].includes(c.receiveMode as string)) c.receiveMode = QQ_DEFAULTS.receiveMode;
+  c.triggerKeywords = (Array.isArray(c.triggerKeywords) ? c.triggerKeywords : String(c.triggerKeywords ?? '').split(/[,，\r\n]+/))
+    .filter((s): s is string => typeof s === 'string').map(s => s.trim()).filter(Boolean).slice(0, 50);
+  if (typeof c.replyWake !== 'boolean') c.replyWake = QQ_DEFAULTS.replyWake;
+  c.historyBackfillLimit = typeof c.historyBackfillLimit === 'number' && Number.isFinite(c.historyBackfillLimit)
+    ? Math.max(0, Math.min(50, Math.floor(c.historyBackfillLimit))) : QQ_DEFAULTS.historyBackfillLimit;
+  c.inputMinIntervalSec = typeof c.inputMinIntervalSec === 'number' && Number.isFinite(c.inputMinIntervalSec)
+    ? Math.max(0, Math.min(3600, c.inputMinIntervalSec)) : 0;
+  c.inputMaxMessagesPerWindow = typeof c.inputMaxMessagesPerWindow === 'number' && Number.isFinite(c.inputMaxMessagesPerWindow)
+    ? Math.max(1, Math.min(50, Math.floor(c.inputMaxMessagesPerWindow))) : 20;
+  // gapRecovery 子对象原地合并，保持引用身份（x-hot 生效）
+  const gr = (c.gapRecovery && typeof c.gapRecovery === 'object' ? c.gapRecovery : {}) as QQGapRecoveryConfig & Record<string, unknown>;
+  c.gapRecovery = gr;
+  Object.assign(gr, { ...QQ_DEFAULTS.gapRecovery, ...gr });
+  if (typeof gr.enabled !== 'boolean') gr.enabled = QQ_DEFAULTS.gapRecovery.enabled;
+  if (typeof gr.groupStaleMinutes !== 'number' || !Number.isFinite(gr.groupStaleMinutes) || gr.groupStaleMinutes < 0) {
+    gr.groupStaleMinutes = QQ_DEFAULTS.gapRecovery.groupStaleMinutes;
+  }
+  if (typeof gr.maxMessages !== 'number' || !Number.isFinite(gr.maxMessages) || gr.maxMessages < 1) {
+    gr.maxMessages = QQ_DEFAULTS.gapRecovery.maxMessages;
+  }
   if (typeof c.maxSequenceGap !== 'number') c.maxSequenceGap = QQ_DEFAULTS.maxSequenceGap;
   if (typeof c.replyMaxGapSec !== 'number') c.replyMaxGapSec = QQ_DEFAULTS.replyMaxGapSec;
   if (typeof c.maxMessageBytes !== 'number') c.maxMessageBytes = QQ_DEFAULTS.maxMessageBytes;
-  if (typeof c.forwardExpandLimit !== 'number') c.forwardExpandLimit = QQ_DEFAULTS.forwardExpandLimit;
+  c.forwardExpandLimit = typeof c.forwardExpandLimit === 'number' && Number.isFinite(c.forwardExpandLimit)
+    ? Math.max(1, Math.min(200, Math.floor(c.forwardExpandLimit))) : QQ_DEFAULTS.forwardExpandLimit;
   if (typeof c.forwardByMessageId !== 'boolean') c.forwardByMessageId = QQ_DEFAULTS.forwardByMessageId;
   if (typeof c.splitReplyBySentence !== 'boolean') c.splitReplyBySentence = true;
   if (typeof c.sentencesPerMessage !== 'number') c.sentencesPerMessage = 1;
+  if (c.atPosition !== 'head' && c.atPosition !== 'tail') c.atPosition = 'head';
   if (typeof c.sendIntervalMs !== 'number') c.sendIntervalMs = QQ_DEFAULTS.sendIntervalMs;
   if (typeof c.deliverImageAttachments !== 'boolean') c.deliverImageAttachments = QQ_DEFAULTS.deliverImageAttachments;
   if (typeof c.emojiDir !== 'string' || !c.emojiDir) c.emojiDir = QQ_DEFAULTS.emojiDir;
